@@ -1,56 +1,59 @@
 {
-  "name": "quasarstream/srtp",
-  "type": "library",
-  "description": "A PHP library for Secure RTP (SRTP) packet encryption and decryption using OpenSSL FFI.",
-  "keywords": [
-    "srtp"
-  ],
-  "homepage": "https://www.quasarstream.com/webrtc",
-  "license": "BSD-3-Clause",
-  "authors": [
-    {
-      "name": "Amin Yazdanpanah",
-      "email": "github@aminyazdanpanah.com"
-    },
-    {
-      "name": "Sana Moniri",
-      "email": "s.mo@quasarstream.com"
-    },
-    {
-      "name": "Quasar Stream Community",
-      "homepage": "https://quasarstream.com/teams"
-    }
-  ],
-  "require": {
-    "php": "^8.4",
-    "ext-ffi": "*",
-    "quasarstream/exception": "^1.0",
-    "quasarstream/mixin": "^1.0"
-  },
-  "require-dev": {
-    "phpunit/php-code-coverage": "11.0.x-dev",
-    "phpunit/phpunit": "^11.3"
-  },
-  "autoload": {
-    "psr-4": {
-      "Webrtc\\Srtp\\": "src"
-    }
-  },
-  "autoload-dev": {
-    "psr-4": {
-      "Tests\\Webrtc\\Srtp\\": "tests"
-    }
-  },
-  "scripts": {
-    "pre-install-cmd": [
-      "@check-linux"
+    "name": "danog/php-rtc-srtp",
+    "type": "library",
+    "description": "A PHP library for Secure RTP (SRTP) packet encryption and decryption using OpenSSL FFI. Fork with FFI made optional and a pure-PHP DTLS/SRTP stack, maintained for MadelineProto.",
+    "keywords": [
+        "srtp"
     ],
-    "pre-update-cmd": [
-      "@check-linux"
+    "homepage": "https://www.quasarstream.com/webrtc",
+    "license": "BSD-3-Clause",
+    "authors": [
+        {
+            "name": "Amin Yazdanpanah",
+            "email": "github@aminyazdanpanah.com"
+        },
+        {
+            "name": "Sana Moniri",
+            "email": "s.mo@quasarstream.com"
+        },
+        {
+            "name": "Quasar Stream Community",
+            "homepage": "https://quasarstream.com/teams"
+        }
     ],
-    "check-linux": [
-      "php -r \"if (stripos(PHP_OS_FAMILY, 'Linux') === false) { fwrite(STDERR, 'This package only supports Linux.' . PHP_EOL); exit(1); }\""
-    ]
-  },
-  "minimum-stability": "dev"
+    "require": {
+        "php": "^8.4",
+        "ext-ffi": "*",
+        "quasarstream/exception": "^1.0",
+        "quasarstream/mixin": "^1.0"
+    },
+    "require-dev": {
+        "phpunit/php-code-coverage": "11.0.x-dev",
+        "phpunit/phpunit": "^11.3"
+    },
+    "autoload": {
+        "psr-4": {
+            "Webrtc\\Srtp\\": "src"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Tests\\Webrtc\\Srtp\\": "tests"
+        }
+    },
+    "scripts": {
+        "pre-install-cmd": [
+            "@check-linux"
+        ],
+        "pre-update-cmd": [
+            "@check-linux"
+        ],
+        "check-linux": [
+            "php -r \"if (stripos(PHP_OS_FAMILY, 'Linux') === false) { fwrite(STDERR, 'This package only supports Linux.' . PHP_EOL); exit(1); }\""
+        ]
+    },
+    "minimum-stability": "dev",
+    "replace": {
+        "quasarstream/srtp": "self.version"
+    }
 }
