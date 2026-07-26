@@ -30,18 +30,18 @@ use Throwable;
 class Session
 {
     /** Label of the SRTP encryption key in the RFC 3711 key derivation function. */
-    private const int LABEL_RTP_ENCRYPTION = 0x00;
-    private const int LABEL_RTP_AUTH = 0x01;
-    private const int LABEL_RTP_SALT = 0x02;
-    private const int LABEL_RTCP_ENCRYPTION = 0x03;
-    private const int LABEL_RTCP_AUTH = 0x04;
-    private const int LABEL_RTCP_SALT = 0x05;
+    private const LABEL_RTP_ENCRYPTION = 0x00;
+    private const LABEL_RTP_AUTH = 0x01;
+    private const LABEL_RTP_SALT = 0x02;
+    private const LABEL_RTCP_ENCRYPTION = 0x03;
+    private const LABEL_RTCP_AUTH = 0x04;
+    private const LABEL_RTCP_SALT = 0x05;
 
     /** Length of the HMAC-SHA1 session authentication key. */
-    private const int AUTH_KEY_LENGTH = 20;
+    private const AUTH_KEY_LENGTH = 20;
 
     /** Sequence numbers are 16 bit, so a rollover happens every 65536 packets. */
-    private const int SEQ_MODULO = 0x10000;
+    private const SEQ_MODULO = 0x10000;
 
     private ?Policy $policy = null;
 

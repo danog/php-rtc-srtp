@@ -13,7 +13,7 @@ namespace Webrtc\Srtp\Exception;
 
 class SrtpValidateException extends SrtpException
 {
-    private const array ERRORS = [
+    private const ERRORS = [
         "nothing to report",
         "unspecified failure",
         "unsupported parameter",
