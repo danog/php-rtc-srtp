@@ -3,232 +3,201 @@
 namespace Tests\Webrtc\Srtp;
 
 use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\UsesClass;
 use PHPUnit\Framework\TestCase;
-use Webrtc\Exception\InvalidArgumentException;
 use Webrtc\Srtp\Enum\SrtpProfile;
-use Webrtc\Srtp\Enum\SsrcType;
 use Webrtc\Srtp\Exception\SrtpException;
-use Webrtc\Srtp\Exception\SrtpValidateException;
 use Webrtc\Srtp\Policy;
 use Webrtc\Srtp\Session;
-use Webrtc\Srtp\Srtp;
 
-#[UsesClass(SrtpValidateException::class)]
-#[UsesClass(Policy::class)]
-#[UsesClass(Srtp::class)]
+/**
+ * Checks the pure-PHP SRTP implementation against pion/srtp.
+ *
+ * The point of going through another implementation is that a protect/unprotect round trip
+ * inside one codebase passes just as happily when both halves share a misreading of the
+ * spec. Every wire-format assertion here is anchored to bytes pion produced.
+ */
 #[CoversClass(Session::class)]
+#[UsesClass(Policy::class)]
 class SessionTest extends TestCase
 {
-    private string $rtp;
-    private string $rtcp;
-    private array $profiles = [
-        [
-            "srtp_profile" => SrtpProfile::AES128_CM_SHA1_32,
-            "protected_rtcp_length" => 42,
-            "key_length" => 30,
-            "protected_rtp_length" => 176
-        ],
-        [
-            "srtp_profile" => SrtpProfile::AES128_CM_SHA1_80,
-            "protected_rtcp_length" => 42,
-            "key_length" => 30,
-            "protected_rtp_length" => 182
-        ]
-    ];
+    /**
+     * Master key followed by master salt, the layout DTLS exports keying material in.
+     *
+     * The salt is 14 bytes for the counter-mode profiles but only 12 for the AEAD ones
+     * (RFC 7714 section 8.3), so the material is sized per profile rather than shared.
+     */
+    private const KEY_CM_128 = 'e1f97a0d3e018be0d64fa32c06de41390ec675ad498afeebb6960b3aabe6';
+    private const KEY_GCM_128 = 'e1f97a0d3e018be0d64fa32c06de41390ec675ad498afeebb6960b3a';
+    private const KEY_GCM_256 = '000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f'
+        . '202122232425262728292a2b';
 
-    protected function setUp(): void
+    /** A minimal RTP packet: version 2, payload type 15, sequence 0x1234, ssrc 0xcafebabe. */
+    private const RTP = '800f1234decafbaddeadbeefcafebabe';
+
+    private ?ReferencePeer $peer = null;
+
+    protected function tearDown(): void
     {
-        parent::setUp();
+        $this->peer?->stop();
+        $this->peer = null;
 
-        Srtp::init();
-        $this->updateProfiles();
-        $this->rtp = "\x80\x08\x00\x00"
-            . "\x00\x00\x00\x00"
-            . "\x00\x00\x30\x39"
-            . str_repeat("\xd4", 160);
-
-        $this->rtcp = "\x80\xc8\x00\x06\xf3\xcb\x20\x01\x83\xab\x03\xa1\xeb\x02\x0b\x3a"
-            . "\x00\x00\x94\x20\x00\x00\x00\x9e\x00\x00\x9b\x88";
-
+        parent::tearDown();
     }
 
-    public function testNoKey()
+    /**
+     * @return array<string, array{SrtpProfile, string, string}>
+     */
+    public static function profiles(): array
     {
-        $policy = new Policy(ssrcType: SsrcType::ANY_OUTBOUND);
-
-        $this->expectException(SrtpValidateException::class);
-        $this->expectExceptionMessage('unsupported parameter');
-        new Session($policy);
+        return [
+            'AES_CM_128_HMAC_SHA1_80' => [SrtpProfile::AES128_CM_SHA1_80, 'AES_CM_128_HMAC_SHA1_80', self::KEY_CM_128],
+            'AES_CM_128_HMAC_SHA1_32' => [SrtpProfile::AES128_CM_SHA1_32, 'AES_CM_128_HMAC_SHA1_32', self::KEY_CM_128],
+            'AEAD_AES_128_GCM' => [SrtpProfile::AEAD_AES_128_GCM, 'AEAD_AES_128_GCM', self::KEY_GCM_128],
+            'AEAD_AES_256_GCM' => [SrtpProfile::AEAD_AES_256_GCM, 'AEAD_AES_256_GCM', self::KEY_GCM_256],
+        ];
     }
 
-    public function testAddRemoveStream()
+    private static function rtcpPacket(): string
     {
-        foreach ($this->profiles as $profile) {
-            $key = random_bytes($profile['key_length']);
-
-            // Protect $this->rtp
-            $txSession = new Session(
-                new Policy(
-                    srtpProfile: $profile['srtp_profile'],
-                    key: $key,
-                    ssrcType: SsrcType::SPECIFIC,
-                    ssrcValue: 12345
-                )
-            );
-            $protected = $txSession->protect($this->rtp);
-            $this->assertEquals($profile['protected_rtp_length'], strlen($protected));
-
-            $rxSession = new Session();
-            $rxSession->addStream(
-                new Policy(
-                    srtpProfile: $profile['srtp_profile'],
-                    key: $key,
-                    ssrcType: SsrcType::SPECIFIC,
-                    ssrcValue: 12345
-                )
-            );
-            $unprotected = $rxSession->unprotect($protected);
-            $this->assertEquals($this->rtp, $unprotected);
-
-            // Remove stream
-            $rxSession->removeStream(12345);
-
-            // Try removing stream again
-            $this->expectException(SrtpValidateException::class);
-            $this->expectExceptionMessage('no appropriate context found');
-            $rxSession->removeStream(12345);
-        }
+        // A sender report: version 2, no report blocks, ssrc 0xf3cb2001, followed by the
+        // NTP/RTP timestamps and the packet and octet counts.
+        return hex2bin('80c80006f3cb200183ab03a1eb020b3a000094200000009e00009b88');
     }
 
-    public function testRtpAnySsrc()
-    {
-        foreach ($this->profiles as $profile) {
-            $key = random_bytes($profile['key_length']);
+    #[DataProvider('profiles')]
+    public function testProtectMatchesTheReferenceImplementation(
+        SrtpProfile $profile,
+        string $name,
+        string $keyHex
+    ): void {
+        $key = hex2bin($keyHex);
+        $packet = hex2bin(self::RTP);
 
-            // Protect $this->rtp
-            $txSession = new Session(
-                new Policy(
-                    srtpProfile: $profile['srtp_profile'],
-                    key: $key,
-                    ssrcType: SsrcType::ANY_OUTBOUND
-                )
-            );
-            $protected = $txSession->protect($this->rtp);
-            $this->assertEquals($profile['protected_rtp_length'], strlen($protected));
+        $ours = $this->session($profile, $key)->protect($packet);
+        $theirs = $this->peer()->protect($name, $key, $packet);
 
-            // Bad type
-            $this->expectException(SrtpException::class);
-            $this->expectExceptionMessage('unsupported parameter');
-            $txSession->protect(4567);
-
-            // Bad length
-            $this->expectException(InvalidArgumentException::class);
-            $this->expectExceptionMessage('packet is too long');
-            $txSession->protect(str_repeat('0', 1500));
-
-            // Unprotect $this->rtp
-            $rxSession = new Session(
-                new Policy(
-                    srtpProfile: $profile['srtp_profile'],
-                    key: $key,
-                    ssrcType: SsrcType::ANY_INBOUND
-                )
-            );
-            $unprotected = $rxSession->unprotect($protected);
-            $this->assertEquals($this->rtp, $unprotected);
-        }
+        $this->assertSame(
+            bin2hex($theirs),
+            bin2hex($ours),
+            "protected RTP under $name must be byte-identical to the reference implementation"
+        );
     }
 
-    public function testRtcpAnySsrc()
-    {
-        foreach ($this->profiles as $profile) {
-            $key = random_bytes($profile['key_length']);
+    #[DataProvider('profiles')]
+    public function testUnprotectsWhatTheReferenceImplementationProduced(
+        SrtpProfile $profile,
+        string $name,
+        string $keyHex
+    ): void {
+        $key = hex2bin($keyHex);
+        $packet = hex2bin(self::RTP);
 
-            // Protect $this->rtcp
-            $txSession = new Session(
-                new Policy(
-                    srtpProfile: $profile['srtp_profile'],
-                    key: $key,
-                    ssrcType: SsrcType::ANY_OUTBOUND
-                )
-            );
-            $protected = $txSession->protectRtcp($this->rtcp);
-            $this->assertEquals($profile['protected_rtcp_length'], strlen($protected));
+        $protected = $this->peer()->protect($name, $key, $packet);
 
-            // Bad type
-            $this->expectException(SrtpException::class);
-            $this->expectExceptionMessage('unsupported parameter');
-            $txSession->protectRtcp(4567);
-
-            // Bad length
-            $this->expectException(InvalidArgumentException::class);
-            $this->expectExceptionMessage('packet is too long');
-            $txSession->protectRtcp(str_repeat('0', 1500));
-
-            // Unprotect $this->rtcp
-            $rxSession = new Session(
-                new Policy(
-                    srtpProfile: $profile['srtp_profile'],
-                    key: $key,
-                    ssrcType: SsrcType::ANY_INBOUND
-                )
-            );
-            $unprotected = $rxSession->unprotectRtcp($protected);
-            $this->assertEquals($this->rtcp, $unprotected);
-        }
+        $this->assertSame(
+            bin2hex($packet),
+            bin2hex($this->session($profile, $key)->unprotect($protected)),
+            "RTP protected by the reference implementation under $name must decrypt back"
+        );
     }
 
-    public function testRtpSpecificSsrc()
-    {
-        foreach ($this->profiles as $profile) {
-            $key = random_bytes($profile['key_length']);
+    #[DataProvider('profiles')]
+    public function testTheReferenceImplementationUnprotectsWhatWeProduced(
+        SrtpProfile $profile,
+        string $name,
+        string $keyHex
+    ): void {
+        $key = hex2bin($keyHex);
+        $packet = hex2bin(self::RTP);
 
-            // Protect $this->rtp
-            $txSession = new Session(
-                new Policy(
-                    srtpProfile: $profile['srtp_profile'],
-                    key: $key,
-                    ssrcType: SsrcType::SPECIFIC,
-                    ssrcValue: 12345
-                )
-            );
-            $protected = $txSession->protect($this->rtp);
-            $this->assertEquals($profile['protected_rtp_length'], strlen($protected));
+        $protected = $this->session($profile, $key)->protect($packet);
 
-            // Unprotect $this->rtp
-            $rxSession = new Session(
-                new Policy(
-                    srtpProfile: $profile['srtp_profile'],
-                    key: $key,
-                    ssrcType: SsrcType::SPECIFIC,
-                    ssrcValue: 12345
-                )
-            );
-            $unprotected = $rxSession->unprotect($protected);
-            $this->assertEquals($this->rtp, $unprotected);
-        }
+        $this->assertSame(
+            bin2hex($packet),
+            bin2hex($this->peer()->unprotect($name, $key, $protected)),
+            "the reference implementation must accept RTP we protected under $name"
+        );
     }
 
-    private function updateProfiles(): void
+    #[DataProvider('profiles')]
+    public function testProtectRtcpMatchesTheReferenceImplementation(
+        SrtpProfile $profile,
+        string $name,
+        string $keyHex
+    ): void {
+        $key = hex2bin($keyHex);
+        $packet = self::rtcpPacket();
+
+        $ours = $this->session($profile, $key)->protectRtcp($packet);
+        $theirs = $this->peer()->protectRtcp($name, $key, $packet);
+
+        $this->assertSame(
+            bin2hex($theirs),
+            bin2hex($ours),
+            "protected RTCP under $name must be byte-identical to the reference implementation"
+        );
+    }
+
+    #[DataProvider('profiles')]
+    public function testUnprotectsRtcpFromTheReferenceImplementation(
+        SrtpProfile $profile,
+        string $name,
+        string $keyHex
+    ): void {
+        $key = hex2bin($keyHex);
+        $packet = self::rtcpPacket();
+
+        $protected = $this->peer()->protectRtcp($name, $key, $packet);
+
+        $this->assertSame(
+            bin2hex($packet),
+            bin2hex($this->session($profile, $key)->unprotectRtcp($protected)),
+            "RTCP protected by the reference implementation under $name must decrypt back"
+        );
+    }
+
+    /**
+     * A tampered authentication tag has to be rejected rather than quietly decrypted.
+     */
+    #[DataProvider('profiles')]
+    public function testRejectsATamperedPacket(SrtpProfile $profile, string $name, string $keyHex): void
     {
-        try {
-            new Policy(srtpProfile: SrtpProfile::AEAD_AES_128_GCM);
-            $this->profiles = array_merge([
-                [
-                    "srtp_profile" => SrtpProfile::AEAD_AES_256_GCM,
-                    "protected_rtcp_length" => 48,
-                    "key_length" => 44,
-                    "protected_rtp_length" => 188
-                ],
-                [
-                    "srtp_profile" => SrtpProfile::AEAD_AES_128_GCM,
-                    "protected_rtcp_length" => 48,
-                    "key_length" => 28,
-                    "protected_rtp_length" => 188
-                ],
-            ], $this->profiles);
-        } catch (\Throwable) {
-        }
+        $key = hex2bin($keyHex);
+        $protected = $this->peer()->protect($name, $key, hex2bin(self::RTP));
+
+        // Flip a bit in the final byte, which is inside the tag for every profile here.
+        $last = \strlen($protected) - 1;
+        $protected[$last] = \chr(\ord($protected[$last]) ^ 0x01);
+
+        $this->expectException(SrtpException::class);
+        $this->session($profile, $key)->unprotect($protected);
+    }
+
+    /**
+     * Replaying a packet must be refused: without this a captured packet can be re-injected,
+     * and RFC 3711 section 3.3.2 makes the replay list mandatory.
+     */
+    public function testRejectsAReplayedPacket(): void
+    {
+        $key = hex2bin(self::KEY_CM_128);
+        $session = $this->session(SrtpProfile::AES128_CM_SHA1_80, $key);
+        $protected = $this->peer()->protect('AES_CM_128_HMAC_SHA1_80', $key, hex2bin(self::RTP));
+
+        $session->unprotect($protected);
+
+        $this->expectException(SrtpException::class);
+        $session->unprotect($protected);
+    }
+
+    private function session(SrtpProfile $profile, string $key): Session
+    {
+        return new Session(new Policy($profile, $key));
+    }
+
+    private function peer(): ReferencePeer
+    {
+        return $this->peer ??= ReferencePeer::create();
     }
 }

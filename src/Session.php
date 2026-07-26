@@ -134,11 +134,17 @@ class Session
     private static function derive(string $masterKey, string $masterSalt, int $label, int $length): string
     {
         // x = key_id XOR master_salt, with key_id = label || (index / kdr), kdr being 0 here.
-        $x = $masterSalt;
-        $offset = \strlen($x) - 7;
-        $x[$offset] = \chr(\ord($x[$offset]) ^ $label);
+        //
+        // The label always lands on octet 7 of the input block (RFC 3711 appendix B.3), which
+        // is not the same as seven octets from the end of the salt: the AEAD profiles use a
+        // 96-bit master salt (RFC 7714 section 12) rather than the 112-bit one, so deriving the
+        // offset from the salt length moved the label two octets and produced session keys no
+        // other implementation agrees with. Counter mode was unaffected only because its salt
+        // happens to make the two expressions coincide.
+        $x = str_pad($masterSalt, 16, "\0");
+        $x[7] = \chr(\ord($x[7]) ^ $label);
 
-        return self::keystream($masterKey, str_pad($x, 16, "\0"), $length);
+        return self::keystream($masterKey, $x, $length);
     }
 
     /**
