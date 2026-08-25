@@ -1,9 +1,15 @@
 # SRTP Adapter for PHP
 
-[![PHP Version](https://img.shields.io/badge/php-%3E%3D8.4-blue.svg)](https://php.net/)
+[![PHP Version](https://img.shields.io/badge/php-%3E%3D8.2-blue.svg)](https://php.net/)
 [![License](https://img.shields.io/badge/license-BSD-blue.svg)](LICENSE)
 
-A PHP library for Secure RTP (SRTP) packet encryption and decryption using OpenSSL FFI. It enables secure media transport for WebRTC applications with support for AES encryption and HMAC authentication.
+A pure-PHP library for Secure RTP (SRTP) and SRTCP packet encryption and decryption. It supports the AES-CM and AES-GCM protection profiles used by WebRTC without requiring OpenSSL or libsrtp FFI bindings.
+
+## About this fork
+
+This is the `danog/php-rtc-srtp` fork used by MadelineProto. It targets PHP 8.2+, replaces the upstream libsrtp binding with an RFC 3711/RFC 7714 implementation backed by phpseclib, and includes interoperability fixes verified against pion/srtp.
+
+The forked stack keeps the upstream `quasarstream/*` dependency constraints for compatibility. Each `danog/php-rtc-*` package replaces its upstream counterpart, so consumers select the complete maintained stack by requiring the corresponding danog packages together.
 
 ## Features
 
@@ -14,8 +20,8 @@ A PHP library for Secure RTP (SRTP) packet encryption and decryption using OpenS
 - 
 ## Requirements
 
-- PHP ≥ 8.4 with FFI extension enabled
-- Srtp development libraries
+- PHP ≥ 8.2
+- phpseclib 3 (installed through Composer)
 - Linux environment (Windows/macOS support planned)
 
 ## Documentation

@@ -1,7 +1,7 @@
 {
     "name": "danog/php-rtc-srtp",
     "type": "library",
-    "description": "A PHP library for Secure RTP (SRTP) packet encryption and decryption using OpenSSL FFI. Fork with FFI made optional and a pure-PHP DTLS/SRTP stack, maintained for MadelineProto.",
+    "description": "Pure-PHP SRTP and SRTCP encryption using phpseclib, with AES-CM and AES-GCM profiles. MadelineProto's PHP 8.2+ fork removes the libsrtp/FFI dependency.",
     "keywords": [
         "srtp"
     ],
