@@ -23,8 +23,8 @@
     ],
     "require": {
         "php": "^8.2",
-        "quasarstream/exception": "^1.0",
-        "quasarstream/mixin": "^1.0",
+        "danog/php-rtc-exception": "^1.0",
+        "danog/php-rtc-mixin": "^1.0",
         "phpseclib/phpseclib": "^3.0"
     },
     "require-dev": {
@@ -52,8 +52,5 @@
             "php -r \"if (stripos(PHP_OS_FAMILY, 'Linux') === false) { fwrite(STDERR, 'This package only supports Linux.' . PHP_EOL); exit(1); }\""
         ]
     },
-    "minimum-stability": "dev",
-    "replace": {
-        "quasarstream/srtp": "self.version"
-    }
+    "minimum-stability": "dev"
 }
