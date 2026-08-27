@@ -31,7 +31,7 @@
         "phpseclib/phpseclib": "^3.0"
     },
     "require-dev": {
-        "phpunit/phpunit": "^11.3"
+        "phpunit/phpunit": "^13.0"
     },
     "autoload": {
         "psr-4": {
@@ -54,5 +54,5 @@
             "php -r \"if (stripos(PHP_OS_FAMILY, 'Linux') === false) { fwrite(STDERR, 'This package only supports Linux.' . PHP_EOL); exit(1); }\""
         ]
     },
-    "minimum-stability": "dev"
+    "minimum-stability": "stable"
 }
