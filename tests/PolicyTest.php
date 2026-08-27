@@ -63,7 +63,15 @@ class PolicyTest extends TestCase
         new Policy($profile, random_bytes($keyLength + $saltLength - 1));
     }
 
-    #[DataProvider('profiles')]
+    public static function profileNames(): array
+    {
+        return array_map(
+            static fn (array $row): array => [$row[0]],
+            self::profiles()
+        );
+    }
+
+    #[DataProvider('profileNames')]
     public function testKnowsWhichProfilesAreAead(SrtpProfile $profile): void
     {
         $this->assertSame(
