@@ -4,6 +4,7 @@ namespace Tests\Webrtc\Srtp;
 
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\UsesClass;
 use PHPUnit\Framework\TestCase;
 use Webrtc\Srtp\Enum\SrtpProfile;
 use Webrtc\Srtp\Enum\SsrcType;
@@ -11,6 +12,7 @@ use Webrtc\Srtp\Exception\SrtpValidateException;
 use Webrtc\Srtp\Policy;
 
 #[CoversClass(Policy::class)]
+#[UsesClass(\Webrtc\Srtp\Exception\SrtpValidateException::class)]
 class PolicyTest extends TestCase
 {
     public function testDefaultsToTheMandatoryProfile(): void

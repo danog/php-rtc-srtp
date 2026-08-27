@@ -24,6 +24,7 @@ use Webrtc\Srtp\Session;
  */
 #[CoversClass(Session::class)]
 #[UsesClass(Policy::class)]
+#[UsesClass(\Webrtc\Srtp\Exception\SrtpValidateException::class)]
 class SessionTest extends TestCase
 {
     /**
