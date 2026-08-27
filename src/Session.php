@@ -11,44 +11,42 @@
 
 namespace Webrtc\Srtp;
 
-use Webrtc\Srtp\Enum\SrtpProfile;
-use Webrtc\Srtp\Exception\SrtpException;
-use Webrtc\Srtp\Exception\SrtpValidateException;
 use phpseclib3\Crypt\AES;
 use Throwable;
+use Webrtc\Srtp\Enum\SsrcType;
+use Webrtc\Srtp\Exception\SrtpException;
+use Webrtc\Srtp\Exception\SrtpValidateException;
 
-/**
- * A pure-PHP SRTP/SRTCP session, implementing RFC 3711 (and RFC 7714 for the AEAD profiles).
- *
- * Upstream this class delegated to libsrtp through FFI. It is reimplemented here so that calls
- * work on a stock PHP installation: the only primitives needed are AES (from phpseclib3, which
- * transparently uses OpenSSL when the extension is available) and HMAC-SHA1 from ext-hash.
- *
- * A session protects one direction of one DTLS association. The same master key covers every SSRC
- * in that direction, so per-SSRC rollover counters and replay windows are tracked separately.
- */
+/** A pure-PHP SRTP/SRTCP session implementing RFC 3711 and RFC 7714. */
 class Session
 {
-    /** Label of the SRTP encryption key in the RFC 3711 key derivation function. */
     private const LABEL_RTP_ENCRYPTION = 0x00;
     private const LABEL_RTP_AUTH = 0x01;
     private const LABEL_RTP_SALT = 0x02;
     private const LABEL_RTCP_ENCRYPTION = 0x03;
     private const LABEL_RTCP_AUTH = 0x04;
     private const LABEL_RTCP_SALT = 0x05;
-
-    /** Length of the HMAC-SHA1 session authentication key. */
     private const AUTH_KEY_LENGTH = 20;
-
-    /** Sequence numbers are 16 bit, so a rollover happens every 65536 packets. */
     private const SEQ_MODULO = 0x10000;
+    private const SEQ_MEDIAN = 0x8000;
+    private const MAX_ROC = 0xFFFFFFFF;
+    private const MAX_SRTCP_INDEX = 0x7FFFFFFF;
+    private const MAX_SRTP_INVOCATIONS = 0x1000000000000;
+    private const MAX_SRTCP_INVOCATIONS = 0x80000000;
+    private const MAX_AES_CM_BYTES = 0x100000;
+    private const MAX_GCM_PLAINTEXT_BYTES = 0xFFFFFFFE0;
 
-    private ?Policy $policy = null;
-
-    private SrtpProfile $profile;
+    private bool $ready = false;
     private bool $aead = false;
+    private bool $allowRepeatTx = false;
+    private int $windowSize = 1024;
     private int $rtpTagLength = 10;
     private int $rtcpTagLength = 10;
+    private int $keyGeneration = 0;
+    private int $rtpKeyInvocations = 0;
+    private int $rtcpKeyInvocations = 0;
+    private SsrcType $ssrcType = SsrcType::UNDEFINED;
+    private int $ssrcValue = 0;
 
     private string $rtpKey = '';
     private string $rtpSalt = '';
@@ -58,100 +56,159 @@ class Session
     private string $rtcpAuthKey = '';
 
     /**
-     * Per-SSRC RTP state: rollover counter, highest seen sequence number and replay bitmap.
-     *
-     * @var array<int, array{roc: int, highestSeq: int, replay: int, seen: bool}>
+     * @var array<int, array{
+     *     highestIndex: int,
+     *     sent: array<int, array{packet: string, protected: ?string, generation: int}>
+     * }>
      */
-    private array $rtpState = [];
+    private array $rtpSendState = [];
 
-    /**
-     * Per-SSRC SRTCP index, used for the outgoing direction.
-     *
-     * @var array<int, int>
-     */
+    /** @var array<int, array{highestIndex: int, received: array<int, true>}> */
+    private array $rtpReceiveState = [];
+
+    /** @var array<int, int> Last outgoing SRTCP index for each SSRC. */
     private array $rtcpIndex = [];
 
-    /**
-     * Highest SRTCP index seen per SSRC, used for replay protection on the incoming direction.
-     *
-     * @var array<int, int>
-     */
-    private array $rtcpHighestIndex = [];
+    /** @var array<int, array{generation: int, invocations: int}> */
+    private array $rtcpKeyUsage = [];
 
-    /**
-     * @throws SrtpValidateException If the policy is not usable.
-     */
+    /** @var array<int, array{highestIndex: int, received: array<int, true>}> */
+    private array $rtcpReceiveState = [];
+
+    /** @var array<int, true> SSRCs removed while the current master key was active. */
+    private array $retiredSsrc = [];
+
+    private ?string $masterKeyId = null;
+
+    /** @throws SrtpValidateException If the policy is not usable. */
     public function __construct(?Policy $policy = null)
     {
+        if (PHP_INT_SIZE < 8) {
+            throw new SrtpValidateException('SRTP requires a 64-bit PHP build for 48-bit packet indices.');
+        }
         if ($policy !== null) {
             $this->addStream($policy);
         }
     }
 
     /**
-     * Install (or replace) the cryptographic policy of this session.
+     * Install or re-key the cryptographic context.
      *
-     * @throws SrtpValidateException If no key was set on the policy.
+     * Packet indices deliberately survive a re-key, as required by RFC 3711 section 3.3.1.
+     * Derived material is computed before the live context is changed, so a primitive failure
+     * cannot leave a half-installed policy behind.
+     *
+     * @throws SrtpValidateException If the policy is unusable or key derivation fails.
      */
     public function addStream(Policy $policy): void
     {
-        if ($policy->getKey() === null) {
+        $material = $policy->getKey();
+        if ($material === null) {
             throw new SrtpValidateException('The SRTP policy has no key!');
         }
-        $this->policy = $policy;
-        $this->profile = $policy->getSrtpProfile();
-        $this->aead = Policy::isAead($this->profile);
-        $this->rtpTagLength = Policy::rtpTagLength($this->profile);
-        $this->rtcpTagLength = Policy::rtcpTagLength($this->profile);
 
-        $masterKey = $policy->getMasterKey();
-        $masterSalt = $policy->getMasterSalt();
-        $keyLength = \strlen($masterKey);
-        $saltLength = \strlen($masterSalt);
+        try {
+            $profile = $policy->getSrtpProfile();
+            $aead = Policy::isAead($profile);
+            $rtpTagLength = Policy::rtpTagLength($profile);
+            $rtcpTagLength = Policy::rtcpTagLength($profile);
+            $masterKey = $policy->getMasterKey();
+            $masterSalt = $policy->getMasterSalt();
+            $keyLength = \strlen($masterKey);
+            $saltLength = \strlen($masterSalt);
 
-        $this->rtpKey = self::derive($masterKey, $masterSalt, self::LABEL_RTP_ENCRYPTION, $keyLength);
-        $this->rtpSalt = self::derive($masterKey, $masterSalt, self::LABEL_RTP_SALT, $saltLength);
-        $this->rtcpKey = self::derive($masterKey, $masterSalt, self::LABEL_RTCP_ENCRYPTION, $keyLength);
-        $this->rtcpSalt = self::derive($masterKey, $masterSalt, self::LABEL_RTCP_SALT, $saltLength);
-        if (!$this->aead) {
-            $this->rtpAuthKey = self::derive($masterKey, $masterSalt, self::LABEL_RTP_AUTH, self::AUTH_KEY_LENGTH);
-            $this->rtcpAuthKey = self::derive($masterKey, $masterSalt, self::LABEL_RTCP_AUTH, self::AUTH_KEY_LENGTH);
+            $rtpKey = self::derive($masterKey, $masterSalt, self::LABEL_RTP_ENCRYPTION, $keyLength);
+            $rtpSalt = self::derive($masterKey, $masterSalt, self::LABEL_RTP_SALT, $saltLength);
+            $rtcpKey = self::derive($masterKey, $masterSalt, self::LABEL_RTCP_ENCRYPTION, $keyLength);
+            $rtcpSalt = self::derive($masterKey, $masterSalt, self::LABEL_RTCP_SALT, $saltLength);
+            $rtpAuthKey = $aead
+                ? ''
+                : self::derive($masterKey, $masterSalt, self::LABEL_RTP_AUTH, self::AUTH_KEY_LENGTH);
+            $rtcpAuthKey = $aead
+                ? ''
+                : self::derive($masterKey, $masterSalt, self::LABEL_RTCP_AUTH, self::AUTH_KEY_LENGTH);
+            $keyId = hash('sha256', $profile->value."\0".$material, true);
+            if (!\is_string($keyId) || \strlen($keyId) !== 32) {
+                throw new SrtpValidateException('Could not identify the installed SRTP master key.');
+            }
+        } catch (SrtpValidateException $e) {
+            throw $e;
+        } catch (Throwable $e) {
+            throw new SrtpValidateException('Could not derive the SRTP session keys.', 0, $e);
         }
+
+        $keyChanged = $this->masterKeyId === null || !hash_equals($this->masterKeyId, $keyId);
+        if ($this->masterKeyId !== null && $keyChanged) {
+            // A new master key starts a new SSRC-allocation lifetime. Packet indices remain.
+            $this->retiredSsrc = [];
+            foreach ($this->rtpSendState as &$state) {
+                $state['sent'] = [];
+            }
+            unset($state);
+            foreach ($this->rtpReceiveState as &$state) {
+                $state['received'] = [];
+            }
+            unset($state);
+            // Old SRTCP packets cannot authenticate under the new key. Starting a fresh replay
+            // list also permits the explicit 31-bit index to wrap safely after a re-key.
+            $this->rtcpReceiveState = [];
+        }
+        if ($keyChanged) {
+            $this->rtpKeyInvocations = 0;
+            $this->rtcpKeyInvocations = 0;
+        }
+
+        $this->aead = $aead;
+        $this->allowRepeatTx = $policy->getAllowRepeatTx();
+        $this->windowSize = $policy->getWindowSize();
+        $this->rtpTagLength = $rtpTagLength;
+        $this->rtcpTagLength = $rtcpTagLength;
+        $this->rtpKey = $rtpKey;
+        $this->rtpSalt = $rtpSalt;
+        $this->rtpAuthKey = $rtpAuthKey;
+        $this->rtcpKey = $rtcpKey;
+        $this->rtcpSalt = $rtcpSalt;
+        $this->rtcpAuthKey = $rtcpAuthKey;
+        $this->ssrcType = $policy->getSsrcType();
+        $this->ssrcValue = $policy->getSsrcValue();
+        $this->masterKeyId = $keyId;
+        if ($keyChanged) {
+            $this->keyGeneration++;
+        }
+        $this->ready = true;
     }
 
     /**
-     * Forget the state associated with an SSRC.
+     * Retire an SSRC and forget its inbound replay state.
+     *
+     * Outbound indices are retained to prevent AES-CTR keystream or AES-GCM nonce reuse. The SSRC
+     * cannot be accepted or issued again until a new master key is installed.
+     *
+     * @throws SrtpValidateException If the SSRC is not an unsigned 32-bit integer.
      */
     public function removeStream(int|string $ssrc): void
     {
-        $ssrc = (int) $ssrc;
-        unset($this->rtpState[$ssrc], $this->rtcpIndex[$ssrc], $this->rtcpHighestIndex[$ssrc]);
+        $ssrc = self::normalizeSsrc($ssrc);
+        unset($this->rtpReceiveState[$ssrc], $this->rtcpReceiveState[$ssrc]);
+        // Re-issuing an SSRC under the same key can repeat an RTP/SRTCP nonce. Retiring even an
+        // as-yet unseen SSRC also makes an administrative removal effective against later input.
+        $this->retiredSsrc[$ssrc] = true;
     }
 
-    /**
-     * RFC 3711 key derivation function: AES in counter mode, keyed with the master key.
-     */
+    /** RFC 3711 AES-CM PRF with key_derivation_rate equal to zero. */
     private static function derive(string $masterKey, string $masterSalt, int $label, int $length): string
     {
-        // x = key_id XOR master_salt, with key_id = label || (index / kdr), kdr being 0 here.
-        //
-        // The label always lands on octet 7 of the input block (RFC 3711 appendix B.3), which
-        // is not the same as seven octets from the end of the salt: the AEAD profiles use a
-        // 96-bit master salt (RFC 7714 section 12) rather than the 112-bit one, so deriving the
-        // offset from the salt length moved the label two octets and produced session keys no
-        // other implementation agrees with. Counter mode was unaffected only because its salt
-        // happens to make the two expressions coincide.
         $x = str_pad($masterSalt, 16, "\0");
         $x[7] = \chr(\ord($x[7]) ^ $label);
-
         return self::keystream($masterKey, $x, $length);
     }
 
-    /**
-     * Produce `$length` bytes of AES counter-mode keystream.
-     */
+    /** Produce AES counter-mode keystream. */
     private static function keystream(string $key, string $iv, int $length): string
     {
+        if ($length > self::MAX_AES_CM_BYTES) {
+            throw new SrtpException('AES-CM cannot safely process more than 2^16 blocks per packet.');
+        }
         if ($length === 0) {
             return '';
         }
@@ -159,39 +216,34 @@ class Session
         $aes->setKey($key);
         $aes->setIV($iv);
         $aes->disablePadding();
-        return substr($aes->encrypt(str_repeat("\0", $length)), 0, $length);
+        $result = $aes->encrypt(str_repeat("\0", $length));
+        if (\strlen($result) < $length) {
+            throw new SrtpException('AES-CTR returned a truncated keystream.');
+        }
+        return substr($result, 0, $length);
     }
 
-    /**
-     * Build the AES counter-mode IV of RFC 3711 §4.1.1.
-     */
+    /** RFC 3711 section 4.1.1 AES-CM IV. */
     private static function iv(string $salt, int $ssrc, int $index): string
     {
-        $iv = str_pad($salt, 16, "\0");
-        // XOR the SSRC in at bytes 4..7 and the 48-bit packet index at bytes 8..13.
-        $mix = str_repeat("\0", 4).pack('N', $ssrc & 0xFFFFFFFF)
-            .pack('N', ($index >> 16) & 0xFFFFFFFF).pack('n', $index & 0xFFFF).\chr(0).\chr(0);
-        return $iv ^ $mix;
+        $mix = str_repeat("\0", 4).pack('N', $ssrc)
+            .pack('N', ($index >> 16) & 0xFFFFFFFF).pack('n', $index & 0xFFFF)."\0\0";
+        return str_pad($salt, 16, "\0") ^ $mix;
     }
 
-    /**
-     * Build the AEAD nonce of RFC 7714 §8.1: the 12 byte salt XORed with the SSRC and index.
-     */
+    /** RFC 7714 SRTP/SRTCP nonce. A 31-bit SRTCP index has two leading zero octets. */
     private static function aeadNonce(string $salt, int $ssrc, int $index): string
     {
-        $mix = str_repeat("\0", 2).pack('N', $ssrc & 0xFFFFFFFF)
+        $mix = "\0\0".pack('N', $ssrc)
             .pack('N', ($index >> 16) & 0xFFFFFFFF).pack('n', $index & 0xFFFF);
         return $salt ^ $mix;
     }
 
-    /**
-     * Length of the RTP header of a packet, including CSRCs and the header extension.
-     *
-     * @throws SrtpException If the packet is malformed.
-     */
-    private static function rtpHeaderLength(string $packet): int
+    /** @throws SrtpException If the packet has an invalid or truncated RTP header. */
+    private static function rtpHeaderLength(string $packet, int $trailerLength = 0): int
     {
-        if (\strlen($packet) < 12) {
+        $packetLength = \strlen($packet) - $trailerLength;
+        if ($packetLength < 12) {
             throw new SrtpException('RTP packet is too short!');
         }
         $first = \ord($packet[0]);
@@ -199,319 +251,585 @@ class Session
             throw new SrtpException('Unsupported RTP version!');
         }
         $length = 12 + 4 * ($first & 0x0F);
-        if ($first & 0x10) {
-            // A header extension follows the CSRC list: 2 bytes of profile, 2 bytes of length.
-            if (\strlen($packet) < $length + 4) {
+        if ($length > $packetLength) {
+            throw new SrtpException('Truncated RTP header!');
+        }
+        if (($first & 0x10) !== 0) {
+            if ($length + 4 > $packetLength) {
                 throw new SrtpException('Truncated RTP header extension!');
             }
-            $words = unpack('n', substr($packet, $length + 2, 2))[1];
-            $length += 4 + 4 * $words;
-        }
-        if (\strlen($packet) < $length) {
-            throw new SrtpException('Truncated RTP header!');
+            $words = unpack('nlength', substr($packet, $length + 2, 2));
+            if ($words === false) {
+                throw new SrtpException('Could not parse the RTP header extension!');
+            }
+            $length += 4 + 4 * $words['length'];
+            if ($length > $packetLength) {
+                throw new SrtpException('Truncated RTP header extension!');
+            }
         }
         return $length;
     }
 
+    /** @throws SrtpException If RTP padding is malformed. */
+    private static function validateRtpPadding(string $packet, int $headerLength): void
+    {
+        if ((\ord($packet[0]) & 0x20) === 0) {
+            return;
+        }
+        $payloadLength = \strlen($packet) - $headerLength;
+        if ($payloadLength === 0) {
+            throw new SrtpException('RTP padding flag is set on an empty payload!');
+        }
+        $paddingLength = \ord($packet[\strlen($packet) - 1]);
+        if ($paddingLength === 0 || $paddingLength > $payloadLength) {
+            throw new SrtpException('Invalid RTP padding length!');
+        }
+    }
+
+    /** @throws SrtpException If the packet cannot be a valid RTCP packet. */
+    private static function validateRtcpEnvelope(string $packet, int $plainLength): void
+    {
+        if ($plainLength < 8 || $plainLength > \strlen($packet)) {
+            throw new SrtpException('RTCP packet is too short!');
+        }
+        if ($plainLength % 4 !== 0) {
+            throw new SrtpException('RTCP packet is not 32-bit aligned!');
+        }
+        if ((\ord($packet[0]) >> 6) !== 2) {
+            throw new SrtpException('Unsupported RTCP version!');
+        }
+    }
+
     /**
-     * Encrypt and authenticate an outgoing RTP packet.
+     * Validate the part of RTCP framing needed by SRTCP itself.
      *
-     * @throws SrtpException If the packet cannot be protected.
+     * The RTCP length describes only the first member of a compound packet and is deliberately
+     * not used to locate the SRTCP trailer (RFC 3711 section 3.4). Full RTCP semantic validation
+     * belongs to the RTCP parser after cryptographic processing.
      */
+    private static function validateRtcpPacket(string $packet): void
+    {
+        self::validateRtcpEnvelope($packet, \strlen($packet));
+    }
+
+    /** @throws SrtpException If the packet cannot be protected. */
     public function protect(string $packet): string
     {
         $this->assertReady();
-        $headerLength = self::rtpHeaderLength($packet);
-        $header = substr($packet, 0, $headerLength);
-        $payload = substr($packet, $headerLength);
+        try {
+            $headerLength = self::rtpHeaderLength($packet);
+            self::validateRtpPadding($packet, $headerLength);
+            $fields = self::rtpFields($packet);
+            $ssrc = $fields['ssrc'];
+            $this->assertSsrcAllowed($ssrc);
 
-        $unpacked = unpack('nseq/Nts/Nssrc', substr($packet, 2, 10));
-        $seq = $unpacked['seq'];
-        $ssrc = $unpacked['ssrc'];
+            [$roc, $index, $cached] = $this->reserveOutgoingRtp($ssrc, $fields['seq'], $packet);
+            if ($cached !== null) {
+                return $cached;
+            }
 
-        $roc = $this->nextOutgoingRoc($ssrc, $seq);
-        $index = ($roc * self::SEQ_MODULO) + $seq;
-
-        if ($this->aead) {
-            $aes = new AES('gcm');
-            $aes->setKey($this->rtpKey);
-            $aes->setNonce(self::aeadNonce($this->rtpSalt, $ssrc, $index));
-            $aes->setAAD($header);
-            return $header.$aes->encrypt($payload).$aes->getTag();
+            $header = substr($packet, 0, $headerLength);
+            $payload = substr($packet, $headerLength);
+            if ($this->aead) {
+                $result = $header.$this->encryptGcm(
+                    $this->rtpKey,
+                    self::aeadNonce($this->rtpSalt, $ssrc, $index),
+                    $header,
+                    $payload,
+                    'SRTP'
+                );
+            } else {
+                $encrypted = $payload === ''
+                    ? ''
+                    : $payload ^ self::keystream(
+                        $this->rtpKey,
+                        self::iv($this->rtpSalt, $ssrc, $index),
+                        \strlen($payload)
+                    );
+                $authenticated = $header.$encrypted;
+                $tag = substr(self::hmacSha1(
+                    $authenticated.pack('N', $roc),
+                    $this->rtpAuthKey
+                ), 0, $this->rtpTagLength);
+                $result = $authenticated.$tag;
+            }
+            $this->commitOutgoingRtp($ssrc, $index, $result);
+            return $result;
+        } catch (SrtpException $e) {
+            throw $e;
+        } catch (Throwable $e) {
+            throw new SrtpException('Could not protect the RTP packet.', 0, $e);
         }
-
-        $encrypted = $payload === ''
-            ? ''
-            : $payload ^ self::keystream($this->rtpKey, self::iv($this->rtpSalt, $ssrc, $index), \strlen($payload));
-
-        $authenticated = $header.$encrypted;
-        $tag = substr(
-            hash_hmac('sha1', $authenticated.pack('N', $roc), $this->rtpAuthKey, true),
-            0,
-            $this->rtpTagLength
-        );
-
-        return $authenticated.$tag;
     }
 
-    /**
-     * Authenticate and decrypt an incoming RTP packet.
-     *
-     * @throws SrtpException If authentication fails or the packet is malformed.
-     */
+    /** @throws SrtpException If authentication fails or the packet is malformed/replayed. */
     public function unprotect(string $packet): string
     {
         $this->assertReady();
-        if (\strlen($packet) < 12 + $this->rtpTagLength) {
-            throw new SrtpException('SRTP packet is too short!');
-        }
-        $unpacked = unpack('nseq/Nts/Nssrc', substr($packet, 2, 10));
-        $seq = $unpacked['seq'];
-        $ssrc = $unpacked['ssrc'];
+        try {
+            $headerLength = self::rtpHeaderLength($packet, $this->rtpTagLength);
+            $fields = self::rtpFields($packet);
+            $this->assertSsrcAllowed($fields['ssrc']);
+            [$roc, $index] = $this->estimateIncomingRtp($fields['ssrc'], $fields['seq']);
+            $this->checkReplay($this->rtpReceiveState[$fields['ssrc']] ?? null, $index, 'SRTP');
 
-        $roc = $this->estimateRoc($ssrc, $seq);
-        $index = ($roc * self::SEQ_MODULO) + $seq;
-        $this->checkReplay($ssrc, $index);
-
-        $headerLength = self::rtpHeaderLength($packet);
-        $header = substr($packet, 0, $headerLength);
-
-        if ($this->aead) {
-            $body = substr($packet, $headerLength, -$this->rtpTagLength);
-            $tag = substr($packet, -$this->rtpTagLength);
-            $aes = new AES('gcm');
-            $aes->setKey($this->rtpKey);
-            $aes->setNonce(self::aeadNonce($this->rtpSalt, $ssrc, $index));
-            $aes->setAAD($header);
-            $aes->setTag($tag);
-            try {
-                $plain = $aes->decrypt($body);
-            } catch (Throwable $e) {
-                // phpseclib signals a tag mismatch by throwing, not by returning false.
-                throw new SrtpException('SRTP authentication failed!', 0, $e);
+            $header = substr($packet, 0, $headerLength);
+            if ($this->aead) {
+                $body = substr($packet, $headerLength, -$this->rtpTagLength);
+                $tag = substr($packet, -$this->rtpTagLength);
+                $payload = $this->decryptGcm(
+                    $this->rtpKey,
+                    self::aeadNonce($this->rtpSalt, $fields['ssrc'], $index),
+                    $header,
+                    $body,
+                    $tag,
+                    'SRTP'
+                );
+            } else {
+                $authenticated = substr($packet, 0, -$this->rtpTagLength);
+                $tag = substr($packet, -$this->rtpTagLength);
+                $expected = substr(self::hmacSha1(
+                    $authenticated.pack('N', $roc),
+                    $this->rtpAuthKey
+                ), 0, $this->rtpTagLength);
+                if (!hash_equals($expected, $tag)) {
+                    throw new SrtpException('SRTP authentication failed!');
+                }
+                $encrypted = substr($authenticated, $headerLength);
+                $payload = $encrypted === ''
+                    ? ''
+                    : $encrypted ^ self::keystream(
+                        $this->rtpKey,
+                        self::iv($this->rtpSalt, $fields['ssrc'], $index),
+                        \strlen($encrypted)
+                    );
             }
-            $this->acceptReplay($ssrc, $index, $seq, $roc);
-            return $header.$plain;
+
+            $plain = $header.$payload;
+            self::validateRtpPadding($plain, $headerLength);
+            $this->acceptReplay($this->rtpReceiveState, $fields['ssrc'], $index);
+            return $plain;
+        } catch (SrtpException $e) {
+            throw $e;
+        } catch (Throwable $e) {
+            throw new SrtpException('Could not unprotect the SRTP packet.', 0, $e);
         }
-
-        $authenticated = substr($packet, 0, -$this->rtpTagLength);
-        $tag = substr($packet, -$this->rtpTagLength);
-        $expected = substr(
-            hash_hmac('sha1', $authenticated.pack('N', $roc), $this->rtpAuthKey, true),
-            0,
-            $this->rtpTagLength
-        );
-        if (!hash_equals($expected, $tag)) {
-            throw new SrtpException('SRTP authentication failed!');
-        }
-
-        $encrypted = substr($authenticated, $headerLength);
-        $payload = $encrypted === ''
-            ? ''
-            : $encrypted ^ self::keystream($this->rtpKey, self::iv($this->rtpSalt, $ssrc, $index), \strlen($encrypted));
-
-        $this->acceptReplay($ssrc, $index, $seq, $roc);
-        return $header.$payload;
     }
 
-    /**
-     * Encrypt and authenticate an outgoing RTCP packet.
-     *
-     * @throws SrtpException If the packet cannot be protected.
-     */
+    /** @throws SrtpException If the packet cannot be protected. */
     public function protectRtcp(string $packet): string
     {
         $this->assertReady();
-        if (\strlen($packet) < 8) {
-            throw new SrtpException('RTCP packet is too short!');
+        try {
+            self::validateRtcpPacket($packet);
+            $ssrc = self::rtcpSsrc($packet);
+            $this->assertSsrcAllowed($ssrc);
+            if ($this->rtcpKeyInvocations >= self::MAX_SRTCP_INVOCATIONS) {
+                throw new SrtpException('The SRTCP packet limit for this key has been reached; re-keying is required.');
+            }
+            // Consume the invocation before touching the primitive so a failed operation cannot
+            // be retried in a way that accidentally reuses partially consumed cryptographic state.
+            $this->rtcpKeyInvocations++;
+            $usage = $this->rtcpKeyUsage[$ssrc] ?? null;
+            if ($usage === null || $usage['generation'] !== $this->keyGeneration) {
+                $usage = ['generation' => $this->keyGeneration, 'invocations' => 0];
+            }
+            if ($usage['invocations'] >= self::MAX_SRTCP_INDEX + 1) {
+                throw new SrtpException('The SRTCP packet limit for this key has been reached; re-keying is required.');
+            }
+            $previous = $this->rtcpIndex[$ssrc] ?? 0;
+            // libSRTP and pion start at one. The explicit index is modulo 2^31, while the
+            // per-key invocation counter prevents any nonce from recurring under one key.
+            $index = ($previous + 1) & self::MAX_SRTCP_INDEX;
+            $this->rtcpIndex[$ssrc] = $index;
+            $usage['invocations']++;
+            $this->rtcpKeyUsage[$ssrc] = $usage;
+            $indexWord = pack('N', $index | 0x80000000);
+            $header = substr($packet, 0, 8);
+            $payload = substr($packet, 8);
+
+            if ($this->aead) {
+                return $header.$this->encryptGcm(
+                    $this->rtcpKey,
+                    self::aeadNonce($this->rtcpSalt, $ssrc, $index),
+                    $header.$indexWord,
+                    $payload,
+                    'SRTCP'
+                ).$indexWord;
+            }
+
+            $encrypted = $payload === ''
+                ? ''
+                : $payload ^ self::keystream(
+                    $this->rtcpKey,
+                    self::iv($this->rtcpSalt, $ssrc, $index),
+                    \strlen($payload)
+                );
+            $authenticated = $header.$encrypted.$indexWord;
+            $tag = substr(self::hmacSha1($authenticated, $this->rtcpAuthKey), 0, $this->rtcpTagLength);
+            return $authenticated.$tag;
+        } catch (SrtpException $e) {
+            throw $e;
+        } catch (Throwable $e) {
+            throw new SrtpException('Could not protect the RTCP packet.', 0, $e);
         }
-        $header = substr($packet, 0, 8);
-        $payload = substr($packet, 8);
-        $ssrc = unpack('N', substr($packet, 4, 4))[1];
-
-        $index = ($this->rtcpIndex[$ssrc] ?? 0) + 1;
-        if ($index > 0x7FFFFFFF) {
-            $index = 1;
-        }
-        $this->rtcpIndex[$ssrc] = $index;
-        // The most significant bit of the trailing word flags the packet as encrypted.
-        $indexWord = pack('N', $index | 0x80000000);
-
-        if ($this->aead) {
-            $aes = new AES('gcm');
-            $aes->setKey($this->rtcpKey);
-            $aes->setNonce(self::aeadNonce($this->rtcpSalt, $ssrc, $index));
-            $aes->setAAD($header.$indexWord);
-            return $header.$aes->encrypt($payload).$aes->getTag().$indexWord;
-        }
-
-        $encrypted = $payload === ''
-            ? ''
-            : $payload ^ self::keystream($this->rtcpKey, self::iv($this->rtcpSalt, $ssrc, $index), \strlen($payload));
-
-        $authenticated = $header.$encrypted.$indexWord;
-        $tag = substr(hash_hmac('sha1', $authenticated, $this->rtcpAuthKey, true), 0, $this->rtcpTagLength);
-
-        return $authenticated.$tag;
     }
 
-    /**
-     * Authenticate and decrypt an incoming RTCP packet.
-     *
-     * @throws SrtpException If authentication fails or the packet is malformed.
-     */
+    /** @throws SrtpException If authentication fails or the packet is malformed/replayed. */
     public function unprotectRtcp(string $packet): string
     {
         $this->assertReady();
-        $minimum = 8 + 4 + $this->rtcpTagLength;
-        if (\strlen($packet) < $minimum) {
-            throw new SrtpException('SRTCP packet is too short!');
-        }
-        $header = substr($packet, 0, 8);
-        $ssrc = unpack('N', substr($packet, 4, 4))[1];
-
-        if ($this->aead) {
-            $indexWord = substr($packet, -4);
-            $body = substr($packet, 8, -(4 + $this->rtcpTagLength));
-            $tag = substr($packet, -(4 + $this->rtcpTagLength), $this->rtcpTagLength);
-        } else {
-            $tag = substr($packet, -$this->rtcpTagLength);
-            $authenticated = substr($packet, 0, -$this->rtcpTagLength);
-            $expected = substr(hash_hmac('sha1', $authenticated, $this->rtcpAuthKey, true), 0, $this->rtcpTagLength);
-            if (!hash_equals($expected, $tag)) {
-                throw new SrtpException('SRTCP authentication failed!');
+        try {
+            $minimum = 8 + 4 + $this->rtcpTagLength;
+            if (\strlen($packet) < $minimum) {
+                throw new SrtpException('SRTCP packet is too short!');
             }
-            $indexWord = substr($authenticated, -4);
-            $body = substr($authenticated, 8, -4);
-        }
+            $plainLength = \strlen($packet) - 4 - $this->rtcpTagLength;
+            self::validateRtcpEnvelope($packet, $plainLength);
+            $header = substr($packet, 0, 8);
+            $ssrc = self::rtcpSsrc($packet);
+            $this->assertSsrcAllowed($ssrc);
 
-        $rawIndex = unpack('N', $indexWord)[1];
-        $encryptedFlag = ($rawIndex & 0x80000000) !== 0;
-        $index = $rawIndex & 0x7FFFFFFF;
-
-        if (($this->rtcpHighestIndex[$ssrc] ?? -1) >= $index) {
-            throw new SrtpException('Replayed SRTCP packet!');
-        }
-
-        if ($this->aead) {
-            $aes = new AES('gcm');
-            $aes->setKey($this->rtcpKey);
-            $aes->setNonce(self::aeadNonce($this->rtcpSalt, $ssrc, $index));
-            $aes->setAAD($header.$indexWord);
-            $aes->setTag($tag);
-            try {
-                $plain = $aes->decrypt($body);
-            } catch (Throwable $e) {
-                throw new SrtpException('SRTCP authentication failed!', 0, $e);
+            if ($this->aead) {
+                $indexWord = substr($packet, -4);
+                $tag = substr($packet, -(4 + $this->rtcpTagLength), $this->rtcpTagLength);
+                $body = substr($packet, 8, -(4 + $this->rtcpTagLength));
+            } else {
+                $tag = substr($packet, -$this->rtcpTagLength);
+                $authenticated = substr($packet, 0, -$this->rtcpTagLength);
+                $expected = substr(
+                    self::hmacSha1($authenticated, $this->rtcpAuthKey),
+                    0,
+                    $this->rtcpTagLength
+                );
+                if (!hash_equals($expected, $tag)) {
+                    throw new SrtpException('SRTCP authentication failed!');
+                }
+                $indexWord = substr($authenticated, -4);
+                $body = substr($authenticated, 8, -4);
             }
-            $this->rtcpHighestIndex[$ssrc] = $index;
-            return $header.$plain;
+
+            $unpacked = unpack('Nindex', $indexWord);
+            if ($unpacked === false) {
+                throw new SrtpException('Could not parse the SRTCP index!');
+            }
+            $rawIndex = $unpacked['index'];
+            $encrypted = ($rawIndex & 0x80000000) !== 0;
+            $index = $rawIndex & self::MAX_SRTCP_INDEX;
+
+            if (!$this->aead) {
+                $this->checkReplay($this->rtcpReceiveState[$ssrc] ?? null, $index, 'SRTCP');
+                $payload = !$encrypted || $body === ''
+                    ? $body
+                    : $body ^ self::keystream(
+                        $this->rtcpKey,
+                        self::iv($this->rtcpSalt, $ssrc, $index),
+                        \strlen($body)
+                    );
+            } elseif ($encrypted) {
+                $payload = $this->decryptGcm(
+                    $this->rtcpKey,
+                    self::aeadNonce($this->rtcpSalt, $ssrc, $index),
+                    $header.$indexWord,
+                    $body,
+                    $tag,
+                    'SRTCP'
+                );
+                // RFC 7714 requires AEAD validation before any replay-state action.
+                $this->checkReplay($this->rtcpReceiveState[$ssrc] ?? null, $index, 'SRTCP');
+            } else {
+                // With E=0 the RTCP packet and ESRTCP word are AAD; the cipher is only a tag.
+                $empty = $this->decryptGcm(
+                    $this->rtcpKey,
+                    self::aeadNonce($this->rtcpSalt, $ssrc, $index),
+                    $header.$body.$indexWord,
+                    '',
+                    $tag,
+                    'SRTCP'
+                );
+                if ($empty !== '') {
+                    throw new SrtpException('Invalid authentication-only SRTCP ciphertext!');
+                }
+                $this->checkReplay($this->rtcpReceiveState[$ssrc] ?? null, $index, 'SRTCP');
+                $payload = $body;
+            }
+
+            $plain = $header.$payload;
+            self::validateRtcpPacket($plain);
+            $this->acceptReplay($this->rtcpReceiveState, $ssrc, $index);
+            return $plain;
+        } catch (SrtpException $e) {
+            throw $e;
+        } catch (Throwable $e) {
+            throw new SrtpException('Could not unprotect the SRTCP packet.', 0, $e);
         }
-
-        $payload = !$encryptedFlag || $body === ''
-            ? $body
-            : $body ^ self::keystream($this->rtcpKey, self::iv($this->rtcpSalt, $ssrc, $index), \strlen($body));
-
-        $this->rtcpHighestIndex[$ssrc] = $index;
-        return $header.$payload;
     }
 
-    /**
-     * Track the rollover counter of an outgoing stream.
-     */
-    private function nextOutgoingRoc(int $ssrc, int $seq): int
+    /** @return array{seq: int, ssrc: int} */
+    private static function rtpFields(string $packet): array
     {
-        if (!isset($this->rtpState[$ssrc])) {
-            $this->rtpState[$ssrc] = ['roc' => 0, 'highestSeq' => $seq, 'replay' => 0, 'seen' => true];
-            return 0;
+        $fields = unpack('nseq/Ntimestamp/Nssrc', substr($packet, 2, 10));
+        if ($fields === false) {
+            throw new SrtpException('Could not parse the RTP header!');
         }
-        $state = &$this->rtpState[$ssrc];
-        if ($seq < $state['highestSeq'] && $state['highestSeq'] - $seq > self::SEQ_MODULO / 2) {
-            $state['roc']++;
-        }
-        $state['highestSeq'] = $seq;
-        return $state['roc'];
+        return ['seq' => $fields['seq'], 'ssrc' => $fields['ssrc']];
     }
 
-    /**
-     * Guess the rollover counter of an incoming packet, per RFC 3711 Appendix A.
-     */
-    private function estimateRoc(int $ssrc, int $seq): int
+    private static function rtcpSsrc(string $packet): int
     {
-        if (!isset($this->rtpState[$ssrc])) {
-            return 0;
+        $field = unpack('Nssrc', substr($packet, 4, 4));
+        if ($field === false) {
+            throw new SrtpException('Could not parse the RTCP SSRC!');
         }
-        $state = $this->rtpState[$ssrc];
-        $roc = $state['roc'];
-        $highest = $state['highestSeq'];
-        $half = self::SEQ_MODULO / 2;
-
-        if ($highest < $half) {
-            if ($seq - $highest > $half) {
-                return $roc > 0 ? $roc - 1 : 0;
-            }
-            return $roc;
-        }
-        if ($highest - $half > $seq) {
-            return $roc + 1;
-        }
-        return $roc;
+        return $field['ssrc'];
     }
 
     /**
-     * Reject packets that were already processed.
+     * Estimate an index relative to the greatest accepted index, following RFC 3711 Appendix A
+     * with the initial-ROC guard used by interoperable implementations.
      *
-     * @throws SrtpException If the packet is a replay or too old.
+     * @return array{roc: int, index: int, difference: int}
      */
-    private function checkReplay(int $ssrc, int $index): void
+    private static function estimateIndex(int $highestIndex, int $seq): array
     {
-        $state = $this->rtpState[$ssrc] ?? null;
-        if ($state === null || !$state['seen']) {
-            return;
+        $localRoc = intdiv($highestIndex, self::SEQ_MODULO);
+        $localSeq = $highestIndex & 0xFFFF;
+        $roc = $localRoc;
+        $difference = $seq - $localSeq;
+
+        if ($highestIndex > self::SEQ_MEDIAN) {
+            if ($localSeq < self::SEQ_MEDIAN && $seq - $localSeq > self::SEQ_MEDIAN) {
+                $roc = $localRoc - 1;
+                $difference -= self::SEQ_MODULO;
+            } elseif ($localSeq >= self::SEQ_MEDIAN && $localSeq - self::SEQ_MEDIAN > $seq) {
+                if ($localRoc === self::MAX_ROC) {
+                    throw new SrtpException('The SRTP packet limit for this key has been reached; re-keying is required.');
+                }
+                $roc = $localRoc + 1;
+                $difference += self::SEQ_MODULO;
+            }
         }
-        $highest = ($state['roc'] * self::SEQ_MODULO) + $state['highestSeq'];
-        $delta = $highest - $index;
-        if ($delta < 0) {
-            return;
-        }
-        $window = $this->policy?->getWindowSize() ?? 1024;
-        // The bitmap only covers 64 packets; anything older is simply refused.
-        if ($delta >= min($window, 64)) {
-            throw new SrtpException('SRTP packet is too old!');
-        }
-        if (($state['replay'] >> $delta) & 1) {
-            throw new SrtpException('Replayed SRTP packet!');
-        }
+
+        return ['roc' => $roc, 'index' => $highestIndex + $difference, 'difference' => $difference];
     }
 
-    /**
-     * Record a successfully authenticated packet in the replay window.
-     */
-    private function acceptReplay(int $ssrc, int $index, int $seq, int $roc): void
+    /** @return array{int, int, ?string} ROC, packet index, and a cached retransmission. */
+    private function reserveOutgoingRtp(int $ssrc, int $seq, string $packet): array
     {
-        if (!isset($this->rtpState[$ssrc])) {
-            $this->rtpState[$ssrc] = ['roc' => $roc, 'highestSeq' => $seq, 'replay' => 1, 'seen' => true];
-            return;
+        if ($this->rtpKeyInvocations >= self::MAX_SRTP_INVOCATIONS) {
+            throw new SrtpException('The SRTP packet limit for this key has been reached; re-keying is required.');
         }
-        $state = &$this->rtpState[$ssrc];
-        $highest = ($state['roc'] * self::SEQ_MODULO) + $state['highestSeq'];
-        if ($index > $highest) {
-            $shift = $index - $highest;
-            $state['replay'] = $shift >= 64 ? 1 : (($state['replay'] << $shift) | 1) & PHP_INT_MAX;
-            $state['roc'] = $roc;
-            $state['highestSeq'] = $seq;
+        $this->rtpKeyInvocations++;
+        if (!isset($this->rtpSendState[$ssrc])) {
+            $index = $seq;
+            $this->rtpSendState[$ssrc] = ['highestIndex' => $index, 'sent' => []];
+            $estimate = ['roc' => 0, 'index' => $index, 'difference' => 0];
         } else {
-            $state['replay'] |= 1 << ($highest - $index);
+            $estimate = self::estimateIndex($this->rtpSendState[$ssrc]['highestIndex'], $seq);
         }
-        $state['seen'] = true;
+
+        $state = &$this->rtpSendState[$ssrc];
+        $index = $estimate['index'];
+        if (isset($state['sent'][$index])) {
+            $previous = $state['sent'][$index];
+            if (
+                $this->allowRepeatTx
+                && $previous['generation'] === $this->keyGeneration
+                && $previous['packet'] === $packet
+                && $previous['protected'] !== null
+            ) {
+                return [$estimate['roc'], $index, $previous['protected']];
+            }
+            throw new SrtpException('Refusing to reuse an SRTP packet index!');
+        }
+        if ($state['highestIndex'] - $index >= $this->windowSize) {
+            throw new SrtpException('Outgoing SRTP packet index is too old to use safely!');
+        }
+
+        if ($estimate['difference'] > 0) {
+            $state['highestIndex'] = $index;
+        }
+        // Reserve before invoking a primitive. A failed invocation may not safely be retried.
+        $state['sent'][$index] = [
+            'packet' => $packet,
+            'protected' => null,
+            'generation' => $this->keyGeneration,
+        ];
+        $this->pruneWindow($state['sent'], $state['highestIndex']);
+        return [$estimate['roc'], $index, null];
     }
 
-    /**
-     * @throws SrtpException If no key was installed yet.
-     */
+    private function commitOutgoingRtp(int $ssrc, int $index, string $protected): void
+    {
+        if (!isset($this->rtpSendState[$ssrc]['sent'][$index])) {
+            throw new SrtpException('SRTP send state was lost before protection completed!');
+        }
+        $this->rtpSendState[$ssrc]['sent'][$index]['protected'] = $protected;
+    }
+
+    /** @return array{int, int} ROC and packet index. */
+    private function estimateIncomingRtp(int $ssrc, int $seq): array
+    {
+        if (!isset($this->rtpReceiveState[$ssrc])) {
+            return [0, $seq];
+        }
+        $estimate = self::estimateIndex($this->rtpReceiveState[$ssrc]['highestIndex'], $seq);
+        return [$estimate['roc'], $estimate['index']];
+    }
+
+    /** @param array{highestIndex: int, received: array<int, true>}|null $state */
+    private function checkReplay(?array $state, int $index, string $protocol): void
+    {
+        if ($state === null) {
+            return;
+        }
+        if ($state['highestIndex'] - $index >= $this->windowSize) {
+            throw new SrtpException("$protocol packet is too old!");
+        }
+        if (isset($state['received'][$index])) {
+            throw new SrtpException("Replayed $protocol packet!");
+        }
+    }
+
+    /** @param array<int, array{highestIndex: int, received: array<int, true>}> $states */
+    private function acceptReplay(array &$states, int $ssrc, int $index): void
+    {
+        if (!isset($states[$ssrc])) {
+            $states[$ssrc] = ['highestIndex' => $index, 'received' => [$index => true]];
+            return;
+        }
+        $state = &$states[$ssrc];
+        if ($index > $state['highestIndex']) {
+            $state['highestIndex'] = $index;
+        }
+        $state['received'][$index] = true;
+        $this->pruneWindow($state['received'], $state['highestIndex']);
+    }
+
+    /** @param array<int, mixed> $entries */
+    private function pruneWindow(array &$entries, int $highestIndex): void
+    {
+        $oldest = $highestIndex - $this->windowSize + 1;
+        foreach ($entries as $index => $_) {
+            if ($index < $oldest) {
+                unset($entries[$index]);
+            }
+        }
+    }
+
+    private function decryptGcm(
+        string $key,
+        string $nonce,
+        string $aad,
+        string $ciphertext,
+        string $tag,
+        string $protocol
+    ): string {
+        if (\strlen($ciphertext) > self::MAX_GCM_PLAINTEXT_BYTES) {
+            throw new SrtpException("$protocol ciphertext exceeds the AES-GCM per-invocation limit!");
+        }
+        if (\strlen($tag) !== 16) {
+            throw new SrtpException("$protocol authentication tag has an invalid length!");
+        }
+        try {
+            // GCM with a 96-bit nonce encrypts from inc32(J0) = nonce || 2. Derive a candidate
+            // plaintext without releasing it, then run the authenticated encryption direction
+            // and compare its complete result in constant time. This avoids phpseclib's portable
+            // GCM decrypt path, whose tag comparison is not constant-time.
+            $ctr = new AES('ctr');
+            $ctr->setKey($key);
+            $ctr->setIV($nonce.pack('N', 2));
+            $ctr->disablePadding();
+            $plain = $ctr->decrypt($ciphertext);
+            $verified = $this->encryptGcm($key, $nonce, $aad, $plain, $protocol);
+            $expectedCiphertext = substr($verified, 0, -16);
+            $expectedTag = substr($verified, -16);
+        } catch (Throwable $e) {
+            if ($e instanceof SrtpException) {
+                throw $e;
+            }
+            throw new SrtpException("$protocol authentication failed!", 0, $e);
+        }
+        $ciphertextValid = hash_equals($expectedCiphertext, $ciphertext);
+        $tagValid = hash_equals($expectedTag, $tag);
+        if (!\is_string($plain) || !$ciphertextValid || !$tagValid) {
+            throw new SrtpException("$protocol authentication failed!");
+        }
+        return $plain;
+    }
+
+    /** Return ciphertext followed by its full RFC 7714 authentication tag. */
+    private function encryptGcm(
+        string $key,
+        string $nonce,
+        string $aad,
+        string $plaintext,
+        string $protocol
+    ): string {
+        if (\strlen($plaintext) > self::MAX_GCM_PLAINTEXT_BYTES) {
+            throw new SrtpException("$protocol plaintext exceeds the AES-GCM per-invocation limit!");
+        }
+        try {
+            $aes = new AES('gcm');
+            $aes->setKey($key);
+            $aes->setNonce($nonce);
+            $aes->setAAD($aad);
+            $ciphertext = $aes->encrypt($plaintext);
+            $tag = $aes->getTag();
+        } catch (Throwable $e) {
+            throw new SrtpException("$protocol encryption failed!", 0, $e);
+        }
+        if (!\is_string($ciphertext) || !\is_string($tag) || \strlen($tag) !== 16) {
+            throw new SrtpException("$protocol encryption returned an invalid result!");
+        }
+        return $ciphertext.$tag;
+    }
+
+    /** Return a full binary HMAC-SHA1 result or fail closed. */
+    private static function hmacSha1(string $message, string $key): string
+    {
+        $result = hash_hmac('sha1', $message, $key, true);
+        if (!\is_string($result) || \strlen($result) !== self::AUTH_KEY_LENGTH) {
+            throw new SrtpException('HMAC-SHA1 returned an invalid result!');
+        }
+        return $result;
+    }
+
+    /** @throws SrtpException If a specific-SSRC policy does not match the packet. */
+    private function assertSsrcAllowed(int $ssrc): void
+    {
+        if (isset($this->retiredSsrc[$ssrc])) {
+            throw new SrtpException('The packet SSRC was removed and cannot be reused with the same key!');
+        }
+        if ($this->ssrcType === SsrcType::SPECIFIC && $ssrc !== $this->ssrcValue) {
+            throw new SrtpException('The packet SSRC does not match the installed SRTP policy!');
+        }
+    }
+
+    /** @throws SrtpValidateException If the SSRC is not an unsigned decimal 32-bit value. */
+    private static function normalizeSsrc(int|string $ssrc): int
+    {
+        if (\is_int($ssrc)) {
+            if ($ssrc < 0 || $ssrc > 0xFFFFFFFF) {
+                throw new SrtpValidateException('The SSRC must be an unsigned 32-bit integer.');
+            }
+            return $ssrc;
+        }
+        if (!preg_match('/^(?:0|[1-9][0-9]*)$/D', $ssrc)) {
+            throw new SrtpValidateException('The SSRC must be an unsigned decimal 32-bit integer.');
+        }
+        $normalized = ltrim($ssrc, '0');
+        $normalized = $normalized === '' ? '0' : $normalized;
+        if (\strlen($normalized) > 10 || (\strlen($normalized) === 10 && $normalized > '4294967295')) {
+            throw new SrtpValidateException('The SSRC must be an unsigned 32-bit integer.');
+        }
+        return (int) $normalized;
+    }
+
+    /** @throws SrtpException If no key was installed. */
     private function assertReady(): void
     {
-        if ($this->policy === null) {
+        if (!$this->ready) {
             throw new SrtpException('The SRTP session has no key!');
         }
     }

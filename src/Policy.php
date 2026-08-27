@@ -39,26 +39,46 @@ class Policy
         private SsrcType $ssrcType = SsrcType::UNDEFINED,
         private int $ssrcValue = 0,
     ) {
-        if (self::keyLength($srtpProfile) === null) {
-            throw new SrtpValidateException("Unsupported SRTP profile: {$srtpProfile->name}");
-        }
+        // Resolve every parameter up front. Unsupported enum cases must fail here instead of
+        // falling through to plausible-looking default key and tag sizes.
+        self::parameters($srtpProfile);
+        self::validateSsrcValue($ssrcValue);
         if ($key !== null) {
             $this->setKey($key);
         }
     }
 
     /**
-     * Master key length of a profile, in bytes, or null if the profile is not implemented.
+     * @return array{key: int, salt: int, rtpTag: int, rtcpTag: int, aead: bool}
+     * @throws SrtpValidateException If the profile is not implemented.
      */
-    public static function keyLength(SrtpProfile $profile): ?int
+    private static function parameters(SrtpProfile $profile): array
     {
         return match ($profile) {
-            SrtpProfile::AES128_CM_SHA1_80,
-            SrtpProfile::AES128_CM_SHA1_32,
-            SrtpProfile::AEAD_AES_128_GCM => 16,
-            SrtpProfile::AEAD_AES_256_GCM => 32,
-            default => null,
+            SrtpProfile::AES128_CM_SHA1_80 => [
+                'key' => 16, 'salt' => 14, 'rtpTag' => 10, 'rtcpTag' => 10, 'aead' => false,
+            ],
+            SrtpProfile::AES128_CM_SHA1_32 => [
+                'key' => 16, 'salt' => 14, 'rtpTag' => 4, 'rtcpTag' => 10, 'aead' => false,
+            ],
+            SrtpProfile::AEAD_AES_128_GCM => [
+                'key' => 16, 'salt' => 12, 'rtpTag' => 16, 'rtcpTag' => 16, 'aead' => true,
+            ],
+            SrtpProfile::AEAD_AES_256_GCM => [
+                'key' => 32, 'salt' => 12, 'rtpTag' => 16, 'rtcpTag' => 16, 'aead' => true,
+            ],
+            default => throw new SrtpValidateException("Unsupported SRTP profile: {$profile->name}"),
         };
+    }
+
+    /**
+     * Master key length of a profile, in bytes.
+     *
+     * @throws SrtpValidateException If the profile is not implemented.
+     */
+    public static function keyLength(SrtpProfile $profile): int
+    {
+        return self::parameters($profile)['key'];
     }
 
     /**
@@ -66,10 +86,7 @@ class Policy
      */
     public static function saltLength(SrtpProfile $profile): int
     {
-        return match ($profile) {
-            SrtpProfile::AEAD_AES_128_GCM, SrtpProfile::AEAD_AES_256_GCM => 12,
-            default => 14,
-        };
+        return self::parameters($profile)['salt'];
     }
 
     /**
@@ -77,7 +94,7 @@ class Policy
      */
     public static function isAead(SrtpProfile $profile): bool
     {
-        return $profile === SrtpProfile::AEAD_AES_128_GCM || $profile === SrtpProfile::AEAD_AES_256_GCM;
+        return self::parameters($profile)['aead'];
     }
 
     /**
@@ -85,11 +102,7 @@ class Policy
      */
     public static function rtpTagLength(SrtpProfile $profile): int
     {
-        return match ($profile) {
-            SrtpProfile::AES128_CM_SHA1_32 => 4,
-            SrtpProfile::AEAD_AES_128_GCM, SrtpProfile::AEAD_AES_256_GCM => 16,
-            default => 10,
-        };
+        return self::parameters($profile)['rtpTag'];
     }
 
     /**
@@ -99,7 +112,7 @@ class Policy
      */
     public static function rtcpTagLength(SrtpProfile $profile): int
     {
-        return self::isAead($profile) ? 16 : 10;
+        return self::parameters($profile)['rtcpTag'];
     }
 
     public function getAllowRepeatTx(): bool
@@ -135,18 +148,28 @@ class Policy
 
     /**
      * The master key, without the trailing master salt.
+     *
+     * @throws SrtpValidateException If no keying material is installed.
      */
     public function getMasterKey(): string
     {
-        return substr((string) $this->key, 0, (int) self::keyLength($this->srtpProfile));
+        if ($this->key === null) {
+            throw new SrtpValidateException('The SRTP policy has no key!');
+        }
+        return substr($this->key, 0, self::keyLength($this->srtpProfile));
     }
 
     /**
      * The master salt, i.e. the tail of the exported key material.
+     *
+     * @throws SrtpValidateException If no keying material is installed.
      */
     public function getMasterSalt(): string
     {
-        return substr((string) $this->key, (int) self::keyLength($this->srtpProfile));
+        if ($this->key === null) {
+            throw new SrtpValidateException('The SRTP policy has no key!');
+        }
+        return substr($this->key, self::keyLength($this->srtpProfile));
     }
 
     public function getSrtpProfile(): SrtpProfile
@@ -171,6 +194,7 @@ class Policy
 
     public function setSsrcValue(int $ssrcValue): void
     {
+        self::validateSsrcValue($ssrcValue);
         $this->ssrcValue = $ssrcValue;
     }
 
@@ -181,6 +205,19 @@ class Policy
 
     public function setWindowSize(int $windowSize): void
     {
+        if ($windowSize < 64) {
+            throw new SrtpValidateException('The SRTP replay window must contain at least 64 packets.');
+        }
         $this->windowSize = $windowSize;
+    }
+
+    /**
+     * @throws SrtpValidateException If the value cannot be encoded as an unsigned 32-bit SSRC.
+     */
+    private static function validateSsrcValue(int $ssrcValue): void
+    {
+        if ($ssrcValue < 0 || $ssrcValue > 0xFFFFFFFF) {
+            throw new SrtpValidateException('The SSRC must be an unsigned 32-bit integer.');
+        }
     }
 }

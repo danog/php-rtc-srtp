@@ -76,6 +76,12 @@ class PolicyTest extends TestCase
         new Policy(SrtpProfile::NULL_SHA1_80);
     }
 
+    public function testProfileHelpersAlsoRejectUnsupportedProfiles(): void
+    {
+        $this->expectException(SrtpValidateException::class);
+        Policy::rtpTagLength(SrtpProfile::NULL_SHA1_32);
+    }
+
     public function testKeyCanBeSetAndCleared(): void
     {
         $key = random_bytes(30);
@@ -88,6 +94,12 @@ class PolicyTest extends TestCase
 
         $policy->setKey();
         $this->assertNull($policy->getKey());
+    }
+
+    public function testReadingMasterKeyWithoutMaterialThrows(): void
+    {
+        $this->expectException(SrtpValidateException::class);
+        (new Policy())->getMasterKey();
     }
 
     public function testAllowRepeatTx(): void
@@ -127,5 +139,17 @@ class PolicyTest extends TestCase
 
         $policy->setWindowSize(4096);
         $this->assertSame(4096, $policy->getWindowSize());
+    }
+
+    public function testRejectsReplayWindowsBelowTheRfcMinimum(): void
+    {
+        $this->expectException(SrtpValidateException::class);
+        (new Policy())->setWindowSize(63);
+    }
+
+    public function testRejectsSsrcOutsideTheUnsigned32BitRange(): void
+    {
+        $this->expectException(SrtpValidateException::class);
+        (new Policy())->setSsrcValue(-1);
     }
 }
