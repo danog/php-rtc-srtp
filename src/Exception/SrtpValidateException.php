@@ -13,7 +13,7 @@ namespace Webrtc\Srtp\Exception;
 
 use Throwable;
 
-class SrtpValidateException extends SrtpException
+final class SrtpValidateException extends SrtpException
 {
     /**
      * The libsrtp status codes, kept so that a numeric status can still be rendered.

@@ -18,7 +18,7 @@ use Webrtc\Srtp\Exception\SrtpException;
 use Webrtc\Srtp\Exception\SrtpValidateException;
 
 /** A pure-PHP SRTP/SRTCP session implementing RFC 3711 and RFC 7714. */
-class Session
+final class Session
 {
     private const LABEL_RTP_ENCRYPTION = 0x00;
     private const LABEL_RTP_AUTH = 0x01;
@@ -128,7 +128,7 @@ class Session
                 ? ''
                 : self::derive($masterKey, $masterSalt, self::LABEL_RTCP_AUTH, self::AUTH_KEY_LENGTH);
             $keyId = hash('sha256', $profile->value."\0".$material, true);
-            if (!\is_string($keyId) || \strlen($keyId) !== 32) {
+            if (\strlen($keyId) !== 32) {
                 throw new SrtpValidateException('Could not identify the installed SRTP master key.');
             }
         } catch (SrtpValidateException $e) {
@@ -262,7 +262,7 @@ class Session
             if ($words === false) {
                 throw new SrtpException('Could not parse the RTP header extension!');
             }
-            $length += 4 + 4 * $words['length'];
+            $length += 4 + 4 * (int) $words['length'];
             if ($length > $packetLength) {
                 throw new SrtpException('Truncated RTP header extension!');
             }
@@ -513,7 +513,7 @@ class Session
             if ($unpacked === false) {
                 throw new SrtpException('Could not parse the SRTCP index!');
             }
-            $rawIndex = $unpacked['index'];
+            $rawIndex = (int) $unpacked['index'];
             $encrypted = ($rawIndex & 0x80000000) !== 0;
             $index = $rawIndex & self::MAX_SRTCP_INDEX;
 
@@ -572,7 +572,7 @@ class Session
         if ($fields === false) {
             throw new SrtpException('Could not parse the RTP header!');
         }
-        return ['seq' => $fields['seq'], 'ssrc' => $fields['ssrc']];
+        return ['seq' => (int) $fields['seq'], 'ssrc' => (int) $fields['ssrc']];
     }
 
     private static function rtcpSsrc(string $packet): int
@@ -581,7 +581,7 @@ class Session
         if ($field === false) {
             throw new SrtpException('Could not parse the RTCP SSRC!');
         }
-        return $field['ssrc'];
+        return (int) $field['ssrc'];
     }
 
     /**
@@ -628,6 +628,7 @@ class Session
             $estimate = self::estimateIndex($this->rtpSendState[$ssrc]['highestIndex'], $seq);
         }
 
+        /** @psalm-suppress UnsupportedPropertyReferenceUsage Psalm cannot model a reference into an array property; the alias is local and correct. */
         $state = &$this->rtpSendState[$ssrc];
         $index = $estimate['index'];
         if (isset($state['sent'][$index])) {
@@ -752,7 +753,7 @@ class Session
         }
         $ciphertextValid = hash_equals($expectedCiphertext, $ciphertext);
         $tagValid = hash_equals($expectedTag, $tag);
-        if (!\is_string($plain) || !$ciphertextValid || !$tagValid) {
+        if (!$ciphertextValid || !$tagValid) {
             throw new SrtpException("$protocol authentication failed!");
         }
         return $plain;
@@ -779,7 +780,7 @@ class Session
         } catch (Throwable $e) {
             throw new SrtpException("$protocol encryption failed!", 0, $e);
         }
-        if (!\is_string($ciphertext) || !\is_string($tag) || \strlen($tag) !== 16) {
+        if (\strlen($tag) !== 16) {
             throw new SrtpException("$protocol encryption returned an invalid result!");
         }
         return $ciphertext.$tag;
@@ -789,7 +790,7 @@ class Session
     private static function hmacSha1(string $message, string $key): string
     {
         $result = hash_hmac('sha1', $message, $key, true);
-        if (!\is_string($result) || \strlen($result) !== self::AUTH_KEY_LENGTH) {
+        if (\strlen($result) !== self::AUTH_KEY_LENGTH) {
             throw new SrtpException('HMAC-SHA1 returned an invalid result!');
         }
         return $result;

@@ -21,7 +21,7 @@ use Webrtc\Srtp\Exception\SrtpValidateException;
  * Upstream this was a thin wrapper around a libsrtp `srtp_policy_t`; it is now a plain value
  * object, since {@see Session} implements SRTP directly in PHP.
  */
-class Policy
+final class Policy
 {
     /** Master key concatenated with the master salt, as produced by the DTLS key exporter. */
     private ?string $key = null;
