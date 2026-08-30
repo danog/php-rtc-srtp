@@ -37,7 +37,7 @@ final class ReferencePeer
     public static function create(): self
     {
         $binary = getenv('PHP_RTC_REFERENCE_BIN')
-            ?: __DIR__ . '/../../reference/bin/refpeer-srtp';
+            ?: __DIR__ . '/../reference/bin/refpeer-srtp';
 
         if (!is_file($binary) || !is_executable($binary)) {
             Assert::markTestSkipped(
