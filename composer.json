@@ -27,7 +27,7 @@
     "require": {
         "php": "^8.2",
         "danog/php-rtc-exception": "^1.1.5",
-        "danog/php-rtc-mixin": "^1.1.6",
+        "danog/php-rtc-mixin": "^1.1.6 || ^2.0",
         "phpseclib/phpseclib": "^3.0.57"
     },
     "require-dev": {
