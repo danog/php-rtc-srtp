@@ -11,7 +11,7 @@
 
 namespace Webrtc\Srtp;
 
-use phpseclib3\Crypt\AES;
+use phpseclib4\Crypt\AES;
 use Throwable;
 use Webrtc\Srtp\Enum\SsrcType;
 use Webrtc\Srtp\Exception\SrtpException;
