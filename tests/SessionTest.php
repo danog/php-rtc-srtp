@@ -339,6 +339,29 @@ class SessionTest extends TestCase
         $session->protect(self::rtpPacket(42, 'changed'));
     }
 
+    public function testTheSendWindowDoesNotKeepThePackets(): void
+    {
+        $session = $this->session(SrtpProfile::AEAD_AES_128_GCM, hex2bin(self::KEY_GCM_128));
+        $payload = str_repeat('v', 1000);
+        for ($seq = 0; $seq < 3000; $seq++) {
+            $session->protect(self::rtpPacket($seq, $payload));
+        }
+
+        // The window spans more than a thousand packets: only their hashes are kept.
+        $this->assertLessThan(200 * 1024, \strlen(serialize($session)));
+        $this->assertStringNotContainsString($payload, serialize($session));
+    }
+
+    public function testAnIndexOutsideTheWindowIsForgotten(): void
+    {
+        $session = $this->session(SrtpProfile::AEAD_AES_128_GCM, hex2bin(self::KEY_GCM_128));
+        for ($seq = 0; $seq < 2000; $seq++) {
+            $session->protect(self::rtpPacket($seq, 'payload'));
+        }
+        $sent = (new ReflectionProperty(Session::class, 'rtpSendState'))->getValue($session);
+        $this->assertCount(1024, reset($sent)['sent']);
+    }
+
     public function testSrtcpCounterExhaustionThrowsInsteadOfWrappingTheNonce(): void
     {
         $session = $this->session(SrtpProfile::AEAD_AES_128_GCM, hex2bin(self::KEY_GCM_128));

@@ -56,10 +56,14 @@ final class Session
     private string $rtcpAuthKey = '';
 
     /**
-     * @var array<int, array{
-     *     highestIndex: int,
-     *     sent: array<int, array{packet: string, protected: ?string, generation: int}>
-     * }>
+     * The packet indexes used so far for each SSRC, within the replay window.
+     *
+     * Every used index is mapped to the key generation it was used with, followed by the SHA-256
+     * of the packet that was protected with it: an index is never used for a different packet, and
+     * an identical retransmission (if allowed) is just protected again, which gives the same result.
+     * The packets themselves are not kept, as the window spans more than a thousand of them.
+     *
+     * @var array<int, array{highestIndex: int, sent: array<int, string>}>
      */
     private array $rtpSendState = [];
 
@@ -323,10 +327,7 @@ final class Session
             $ssrc = $fields['ssrc'];
             $this->assertSsrcAllowed($ssrc);
 
-            [$roc, $index, $cached] = $this->reserveOutgoingRtp($ssrc, $fields['seq'], $packet);
-            if ($cached !== null) {
-                return $cached;
-            }
+            [$roc, $index] = $this->reserveOutgoingRtp($ssrc, $fields['seq'], $packet);
 
             $header = substr($packet, 0, $headerLength);
             $payload = substr($packet, $headerLength);
@@ -353,7 +354,6 @@ final class Session
                 ), 0, $this->rtpTagLength);
                 $result = $authenticated.$tag;
             }
-            $this->commitOutgoingRtp($ssrc, $index, $result);
             return $result;
         } catch (SrtpException $e) {
             throw $e;
@@ -613,7 +613,7 @@ final class Session
         return ['roc' => $roc, 'index' => $highestIndex + $difference, 'difference' => $difference];
     }
 
-    /** @return array{int, int, ?string} ROC, packet index, and a cached retransmission. */
+    /** @return array{int, int} ROC and packet index. */
     private function reserveOutgoingRtp(int $ssrc, int $seq, string $packet): array
     {
         if ($this->rtpKeyInvocations >= self::MAX_SRTP_INVOCATIONS) {
@@ -631,15 +631,11 @@ final class Session
         /** @psalm-suppress UnsupportedPropertyReferenceUsage Psalm cannot model a reference into an array property; the alias is local and correct. */
         $state = &$this->rtpSendState[$ssrc];
         $index = $estimate['index'];
+        $used = pack('N', $this->keyGeneration).hash('sha256', $packet, true);
         if (isset($state['sent'][$index])) {
-            $previous = $state['sent'][$index];
-            if (
-                $this->allowRepeatTx
-                && $previous['generation'] === $this->keyGeneration
-                && $previous['packet'] === $packet
-                && $previous['protected'] !== null
-            ) {
-                return [$estimate['roc'], $index, $previous['protected']];
+            if ($this->allowRepeatTx && hash_equals($state['sent'][$index], $used)) {
+                // The same packet with the same key and index: protecting it again gives the same result.
+                return [$estimate['roc'], $index];
             }
             throw new SrtpException('Refusing to reuse an SRTP packet index!');
         }
@@ -650,22 +646,10 @@ final class Session
         if ($estimate['difference'] > 0) {
             $state['highestIndex'] = $index;
         }
-        // Reserve before invoking a primitive. A failed invocation may not safely be retried.
-        $state['sent'][$index] = [
-            'packet' => $packet,
-            'protected' => null,
-            'generation' => $this->keyGeneration,
-        ];
+        // Reserve before invoking a primitive.
+        $state['sent'][$index] = $used;
         $this->pruneWindow($state['sent'], $state['highestIndex']);
-        return [$estimate['roc'], $index, null];
-    }
-
-    private function commitOutgoingRtp(int $ssrc, int $index, string $protected): void
-    {
-        if (!isset($this->rtpSendState[$ssrc]['sent'][$index])) {
-            throw new SrtpException('SRTP send state was lost before protection completed!');
-        }
-        $this->rtpSendState[$ssrc]['sent'][$index]['protected'] = $protected;
+        return [$estimate['roc'], $index];
     }
 
     /** @return array{int, int} ROC and packet index. */
@@ -707,14 +691,23 @@ final class Session
         $this->pruneWindow($state['received'], $state['highestIndex']);
     }
 
-    /** @param array<int, mixed> $entries */
+    /**
+     * Forget the entries that left the window.
+     *
+     * Entries are added in (nearly) increasing index order, so the oldest ones come first: stop at the
+     * first one still in the window, instead of going through the whole window for every packet. An
+     * entry added out of order is forgotten once the ones before it are.
+     *
+     * @param array<int, mixed> $entries
+     */
     private function pruneWindow(array &$entries, int $highestIndex): void
     {
         $oldest = $highestIndex - $this->windowSize + 1;
         foreach ($entries as $index => $_) {
-            if ($index < $oldest) {
-                unset($entries[$index]);
+            if ($index >= $oldest) {
+                break;
             }
+            unset($entries[$index]);
         }
     }
 
