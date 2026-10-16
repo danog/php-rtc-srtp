@@ -24,6 +24,7 @@ use Webrtc\Srtp\Session;
  */
 #[CoversClass(Session::class)]
 #[UsesClass(Policy::class)]
+#[UsesClass(\Webrtc\Srtp\Aes::class)]
 #[UsesClass(\Webrtc\Srtp\Exception\SrtpValidateException::class)]
 class SessionTest extends TestCase
 {
@@ -360,6 +361,38 @@ class SessionTest extends TestCase
         }
         $sent = (new ReflectionProperty(Session::class, 'rtpSendState'))->getValue($session);
         $this->assertCount(1024, reset($sent)['sent']);
+    }
+
+    public function testAWindowSavedByAnOlderVersionIsPruned(): void
+    {
+        $session = $this->session(SrtpProfile::AEAD_AES_128_GCM, hex2bin(self::KEY_GCM_128));
+        for ($seq = 0; $seq < 1500; $seq++) {
+            $session->protect(self::rtpPacket($seq, 'payload'));
+        }
+        $property = new ReflectionProperty(Session::class, 'rtpSendState');
+        $state = $property->getValue($session);
+        foreach ($state as &$ssrc) {
+            unset($ssrc['pruned']);
+        }
+        unset($ssrc);
+        $property->setValue($session, $state);
+
+        for (; $seq < 3000; $seq++) {
+            $session->protect(self::rtpPacket($seq, 'payload'));
+        }
+        $this->assertCount(1024, reset($property->getValue($session))['sent']);
+    }
+
+    public function testTheWindowIsPrunedAfterAJump(): void
+    {
+        $session = $this->session(SrtpProfile::AEAD_AES_128_GCM, hex2bin(self::KEY_GCM_128));
+        for ($seq = 0; $seq < 100; $seq++) {
+            $session->protect(self::rtpPacket($seq, 'payload'));
+        }
+        // Far ahead, but in the same rollover.
+        $session->protect(self::rtpPacket(30000, 'payload'));
+        $sent = reset((new ReflectionProperty(Session::class, 'rtpSendState'))->getValue($session))['sent'];
+        $this->assertSame([30000], array_keys($sent));
     }
 
     public function testSrtcpCounterExhaustionThrowsInsteadOfWrappingTheNonce(): void

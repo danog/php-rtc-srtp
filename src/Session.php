@@ -11,7 +11,6 @@
 
 namespace Webrtc\Srtp;
 
-use phpseclib4\Crypt\AES;
 use Throwable;
 use Webrtc\Srtp\Enum\SsrcType;
 use Webrtc\Srtp\Exception\SrtpException;
@@ -63,11 +62,11 @@ final class Session
      * an identical retransmission (if allowed) is just protected again, which gives the same result.
      * The packets themselves are not kept, as the window spans more than a thousand of them.
      *
-     * @var array<int, array{highestIndex: int, sent: array<int, string>}>
+     * @var array<int, array{highestIndex: int, sent: array<int, string>, pruned?: ?int}>
      */
     private array $rtpSendState = [];
 
-    /** @var array<int, array{highestIndex: int, received: array<int, true>}> */
+    /** @var array<int, array{highestIndex: int, received: array<int, true>, pruned?: ?int}> */
     private array $rtpReceiveState = [];
 
     /** @var array<int, int> Last outgoing SRTCP index for each SSRC. */
@@ -76,7 +75,7 @@ final class Session
     /** @var array<int, array{generation: int, invocations: int}> */
     private array $rtcpKeyUsage = [];
 
-    /** @var array<int, array{highestIndex: int, received: array<int, true>}> */
+    /** @var array<int, array{highestIndex: int, received: array<int, true>, pruned?: ?int}> */
     private array $rtcpReceiveState = [];
 
     /** @var array<int, true> SSRCs removed while the current master key was active. */
@@ -216,11 +215,7 @@ final class Session
         if ($length === 0) {
             return '';
         }
-        $aes = new AES('ctr');
-        $aes->setKey($key);
-        $aes->setIV($iv);
-        $aes->disablePadding();
-        $result = $aes->encrypt(str_repeat("\0", $length));
+        $result = Aes::ctr($key, $iv, str_repeat("\0", $length));
         if (\strlen($result) < $length) {
             throw new SrtpException('AES-CTR returned a truncated keystream.');
         }
@@ -622,7 +617,7 @@ final class Session
         $this->rtpKeyInvocations++;
         if (!isset($this->rtpSendState[$ssrc])) {
             $index = $seq;
-            $this->rtpSendState[$ssrc] = ['highestIndex' => $index, 'sent' => []];
+            $this->rtpSendState[$ssrc] = ['highestIndex' => $index, 'sent' => [], 'pruned' => $index];
             $estimate = ['roc' => 0, 'index' => $index, 'difference' => 0];
         } else {
             $estimate = self::estimateIndex($this->rtpSendState[$ssrc]['highestIndex'], $seq);
@@ -648,7 +643,9 @@ final class Session
         }
         // Reserve before invoking a primitive.
         $state['sent'][$index] = $used;
-        $this->pruneWindow($state['sent'], $state['highestIndex']);
+        // Not saved by older versions.
+        $state['pruned'] ??= null;
+        $this->pruneWindow($state['sent'], $state['highestIndex'], $state['pruned']);
         return [$estimate['roc'], $index];
     }
 
@@ -662,7 +659,7 @@ final class Session
         return [$estimate['roc'], $estimate['index']];
     }
 
-    /** @param array{highestIndex: int, received: array<int, true>}|null $state */
+    /** @param array{highestIndex: int, received: array<int, true>, pruned?: ?int}|null $state */
     private function checkReplay(?array $state, int $index, string $protocol): void
     {
         if ($state === null) {
@@ -676,11 +673,11 @@ final class Session
         }
     }
 
-    /** @param array<int, array{highestIndex: int, received: array<int, true>}> $states */
+    /** @param array<int, array{highestIndex: int, received: array<int, true>, pruned?: ?int}> $states */
     private function acceptReplay(array &$states, int $ssrc, int $index): void
     {
         if (!isset($states[$ssrc])) {
-            $states[$ssrc] = ['highestIndex' => $index, 'received' => [$index => true]];
+            $states[$ssrc] = ['highestIndex' => $index, 'received' => [$index => true], 'pruned' => $index];
             return;
         }
         $state = &$states[$ssrc];
@@ -688,27 +685,41 @@ final class Session
             $state['highestIndex'] = $index;
         }
         $state['received'][$index] = true;
-        $this->pruneWindow($state['received'], $state['highestIndex']);
+        // Not saved by older versions.
+        $state['pruned'] ??= null;
+        $this->pruneWindow($state['received'], $state['highestIndex'], $state['pruned']);
     }
 
     /**
      * Forget the entries that left the window.
      *
-     * Entries are added in (nearly) increasing index order, so the oldest ones come first: stop at the
-     * first one still in the window, instead of going through the whole window for every packet. An
-     * entry added out of order is forgotten once the ones before it are.
+     * The window only moves forward, and no entry is ever added before it: the indexes that left it
+     * since it was last pruned are removed directly. (Iterating over the entries, or looking for the
+     * first one, would go through the whole window for every packet.)
      *
      * @param array<int, mixed> $entries
+     * @param ?int              $pruned  No entry is older than this index (null if unknown, for windows saved by older versions).
      */
-    private function pruneWindow(array &$entries, int $highestIndex): void
+    private function pruneWindow(array &$entries, int $highestIndex, ?int &$pruned): void
     {
         $oldest = $highestIndex - $this->windowSize + 1;
-        foreach ($entries as $index => $_) {
-            if ($index >= $oldest) {
-                break;
-            }
-            unset($entries[$index]);
+        $pruned ??= array_key_first($entries) ?? $oldest;
+        if ($pruned >= $oldest) {
+            return;
         }
+        if ($oldest - $pruned > \count($entries)) {
+            // The window moved further than there are entries.
+            foreach (array_keys($entries) as $index) {
+                if ($index < $oldest) {
+                    unset($entries[$index]);
+                }
+            }
+        } else {
+            for ($index = $pruned; $index < $oldest; $index++) {
+                unset($entries[$index]);
+            }
+        }
+        $pruned = $oldest;
     }
 
     private function decryptGcm(
@@ -726,27 +737,14 @@ final class Session
             throw new SrtpException("$protocol authentication tag has an invalid length!");
         }
         try {
-            // GCM with a 96-bit nonce encrypts from inc32(J0) = nonce || 2. Derive a candidate
-            // plaintext without releasing it, then run the authenticated encryption direction
-            // and compare its complete result in constant time. This avoids phpseclib's portable
-            // GCM decrypt path, whose tag comparison is not constant-time.
-            $ctr = new AES('ctr');
-            $ctr->setKey($key);
-            $ctr->setIV($nonce.pack('N', 2));
-            $ctr->disablePadding();
-            $plain = $ctr->decrypt($ciphertext);
-            $verified = $this->encryptGcm($key, $nonce, $aad, $plain, $protocol);
-            $expectedCiphertext = substr($verified, 0, -16);
-            $expectedTag = substr($verified, -16);
+            $plain = Aes::gcmDecrypt($key, $nonce, $aad, $ciphertext, $tag);
         } catch (Throwable $e) {
             if ($e instanceof SrtpException) {
                 throw $e;
             }
             throw new SrtpException("$protocol authentication failed!", 0, $e);
         }
-        $ciphertextValid = hash_equals($expectedCiphertext, $ciphertext);
-        $tagValid = hash_equals($expectedTag, $tag);
-        if (!$ciphertextValid || !$tagValid) {
+        if ($plain === false) {
             throw new SrtpException("$protocol authentication failed!");
         }
         return $plain;
@@ -764,19 +762,14 @@ final class Session
             throw new SrtpException("$protocol plaintext exceeds the AES-GCM per-invocation limit!");
         }
         try {
-            $aes = new AES('gcm');
-            $aes->setKey($key);
-            $aes->setNonce($nonce);
-            $aes->setAAD($aad);
-            $ciphertext = $aes->encrypt($plaintext);
-            $tag = $aes->getTag();
+            $result = Aes::gcmEncrypt($key, $nonce, $aad, $plaintext);
         } catch (Throwable $e) {
             throw new SrtpException("$protocol encryption failed!", 0, $e);
         }
-        if (\strlen($tag) !== 16) {
+        if (\strlen($result) !== \strlen($plaintext) + 16) {
             throw new SrtpException("$protocol encryption returned an invalid result!");
         }
-        return $ciphertext.$tag;
+        return $result;
     }
 
     /** Return a full binary HMAC-SHA1 result or fail closed. */
