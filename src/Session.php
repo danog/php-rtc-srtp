@@ -626,7 +626,7 @@ final class Session
         /** @psalm-suppress UnsupportedPropertyReferenceUsage Psalm cannot model a reference into an array property; the alias is local and correct. */
         $state = &$this->rtpSendState[$ssrc];
         $index = $estimate['index'];
-        $used = pack('N', $this->keyGeneration).hash('sha256', $packet, true);
+        $used = pack('N', $this->keyGeneration).Digest::sha256($packet);
         if (isset($state['sent'][$index])) {
             if ($this->allowRepeatTx && hash_equals($state['sent'][$index], $used)) {
                 // The same packet with the same key and index: protecting it again gives the same result.
@@ -775,7 +775,7 @@ final class Session
     /** Return a full binary HMAC-SHA1 result or fail closed. */
     private static function hmacSha1(string $message, string $key): string
     {
-        $result = hash_hmac('sha1', $message, $key, true);
+        $result = Digest::hmacSha1($message, $key);
         if (\strlen($result) !== self::AUTH_KEY_LENGTH) {
             throw new SrtpException('HMAC-SHA1 returned an invalid result!');
         }
