@@ -4,8 +4,12 @@ declare(strict_types=1);
 
 namespace Webrtc\Srtp;
 
+use danog\MadelineProto\Native\Hash;
+
 /**
  * SHA-256 and HMAC-SHA1 of packets, with the faster backend for their size.
+ *
+ * madeline_crypto 0.5+ hashes faster than both, if loaded (for HMAC-SHA1, see {@see HmacSha1Key}).
  *
  * OpenSSL costs a fixed overhead per call (from ~250 ns to several microseconds with OpenSSL 3's providers), then
  * uses the CPU's SHA instructions. PHP's hash extension has no such overhead, but uses SHA instructions only on x86
@@ -20,8 +24,18 @@ final class Digest
     /** @var array<'sha1'|'sha256', int> The size from which OpenSSL is faster, per algorithm. */
     private static array $opensslFrom = [];
 
+    /**
+     * Whether to use madeline_crypto (null: if available).
+     *
+     * @internal For tests.
+     */
+    public static ?bool $native = null;
+
     public static function sha256(string $data): string
     {
+        if (self::$native ??= Aes::nativeAvailable()) {
+            return Hash::digest('sha256', $data);
+        }
         if (\strlen($data) >= (self::$opensslFrom['sha256'] ??= self::measureOpensslFrom('sha256'))) {
             $digest = openssl_digest($data, 'sha256', true);
             if ($digest !== false) {

@@ -14,6 +14,7 @@ use Webrtc\Srtp\Digest;
  * Both backends of Digest (OpenSSL and the hash extension) give the digests of the hash extension, for every size.
  */
 #[CoversClass(Digest::class)]
+#[\PHPUnit\Framework\Attributes\UsesClass(\Webrtc\Srtp\Aes::class)]
 final class DigestTest extends TestCase
 {
     /** @var array<'sha1'|'sha256', int> */
@@ -26,19 +27,24 @@ final class DigestTest extends TestCase
 
     protected function tearDown(): void
     {
+        Digest::$native = null;
         (new ReflectionProperty(Digest::class, 'opensslFrom'))->setValue(null, $this->opensslFrom);
     }
 
-    /** @return iterable<string, array{int}> */
+    /** @return iterable<string, array{int, bool}> */
     public static function backends(): iterable
     {
-        yield 'OpenSSL' => [0];
-        yield 'hash extension' => [PHP_INT_MAX];
+        yield 'OpenSSL' => [0, false];
+        yield 'hash extension' => [PHP_INT_MAX, false];
+        if (\Webrtc\Srtp\Aes::nativeAvailable()) {
+            yield 'madeline_crypto' => [PHP_INT_MAX, true];
+        }
     }
 
     #[DataProvider('backends')]
-    public function testDigestsMatchTheHashExtension(int $opensslFrom): void
+    public function testDigestsMatchTheHashExtension(int $opensslFrom, bool $native): void
     {
+        Digest::$native = $native;
         (new ReflectionProperty(Digest::class, 'opensslFrom'))->setValue(null, ['sha1' => $opensslFrom, 'sha256' => $opensslFrom]);
         foreach ([0, 1, 55, 63, 64, 65, 200, 1200, 1500, 70000] as $size) {
             $data = $size ? random_bytes($size) : "";
