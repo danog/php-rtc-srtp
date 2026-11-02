@@ -35,7 +35,7 @@ final class Policy
      */
     public function __construct(
         private readonly SrtpProfile $srtpProfile = SrtpProfile::AES128_CM_SHA1_80,
-        ?string $key = null,
+        #[\SensitiveParameter] ?string $key = null,
         private SsrcType $ssrcType = SsrcType::UNDEFINED,
         private int $ssrcValue = 0,
     ) {
@@ -128,7 +128,7 @@ final class Policy
     /**
      * @throws SrtpValidateException If the key does not match the profile's expected length.
      */
-    public function setKey(?string $key = null): void
+    public function setKey(#[\SensitiveParameter] ?string $key = null): void
     {
         if ($key !== null) {
             $expected = self::keyLength($this->srtpProfile) + self::saltLength($this->srtpProfile);

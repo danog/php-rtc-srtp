@@ -257,7 +257,7 @@ final class Session
     }
 
     /** RFC 3711 AES-CM PRF with key_derivation_rate equal to zero. */
-    private static function derive(AesCtrKey $masterKey, string $masterSalt, int $label, int $length): string
+    private static function derive(#[\SensitiveParameter] AesCtrKey $masterKey, #[\SensitiveParameter] string $masterSalt, int $label, int $length): string
     {
         $x = str_pad($masterSalt, 16, "\0");
         $x[7] = \chr(\ord($x[7]) ^ $label);
@@ -265,7 +265,7 @@ final class Session
     }
 
     /** Encrypt (or decrypt) a payload with AES-CM. */
-    private static function aesCm(?AesCtrKey $key, string $iv, string $data): string
+    private static function aesCm(#[\SensitiveParameter] ?AesCtrKey $key, string $iv, string $data): string
     {
         if (\strlen($data) > self::MAX_AES_CM_BYTES) {
             throw new SrtpException('AES-CM cannot safely process more than 2^16 blocks per packet.');
@@ -281,13 +281,13 @@ final class Session
     }
 
     /** RFC 3711 section 4.1.1 AES-CM IV. */
-    private static function iv(string $salt, int $ssrc, int $index): string
+    private static function iv(#[\SensitiveParameter] string $salt, int $ssrc, int $index): string
     {
         return str_pad($salt, 16, "\0") ^ pack('NNNnn', 0, $ssrc, ($index >> 16) & 0xFFFFFFFF, $index & 0xFFFF, 0);
     }
 
     /** RFC 7714 SRTP/SRTCP nonce. A 31-bit SRTCP index has two leading zero octets. */
-    private static function aeadNonce(string $salt, int $ssrc, int $index): string
+    private static function aeadNonce(#[\SensitiveParameter] string $salt, int $ssrc, int $index): string
     {
         return $salt ^ pack('nNNn', 0, $ssrc, ($index >> 16) & 0xFFFFFFFF, $index & 0xFFFF);
     }
@@ -759,7 +759,7 @@ final class Session
     }
 
     private function decryptGcm(
-        ?AesGcmKey $key,
+        #[\SensitiveParameter] ?AesGcmKey $key,
         string $nonce,
         string $aad,
         string $ciphertext,
@@ -791,7 +791,7 @@ final class Session
 
     /** Return ciphertext followed by its full RFC 7714 authentication tag. */
     private function encryptGcm(
-        ?AesGcmKey $key,
+        #[\SensitiveParameter] ?AesGcmKey $key,
         string $nonce,
         string $aad,
         string $plaintext,
@@ -815,7 +815,7 @@ final class Session
     }
 
     /** Return a full binary HMAC-SHA1 result or fail closed. */
-    private static function hmacSha1(string $message, ?HmacSha1Key $key): string
+    private static function hmacSha1(string $message, #[\SensitiveParameter] ?HmacSha1Key $key): string
     {
         if ($key === null) {
             throw new SrtpException('The SRTP session has no authentication key!');
