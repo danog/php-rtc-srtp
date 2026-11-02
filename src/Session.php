@@ -34,6 +34,8 @@ final class Session
     private const MAX_SRTCP_INVOCATIONS = 0x80000000;
     private const MAX_AES_CM_BYTES = 0x100000;
     private const MAX_GCM_PLAINTEXT_BYTES = 0xFFFFFFFE0;
+    /** The properties that hold key objects, set up again when unserialized. */
+    private const KEY_OBJECTS = ['rtpGcm' => true, 'rtcpGcm' => true, 'rtpCtr' => true, 'rtcpCtr' => true, 'rtpHmac' => true, 'rtcpHmac' => true];
 
     private bool $ready = false;
     private bool $aead = false;
@@ -53,6 +55,14 @@ final class Session
     private string $rtcpKey = '';
     private string $rtcpSalt = '';
     private string $rtcpAuthKey = '';
+
+    // The keys above, set up for the packets: not serialized (see __sleep()), but set up again.
+    private ?AesGcmKey $rtpGcm = null;
+    private ?AesGcmKey $rtcpGcm = null;
+    private ?AesCtrKey $rtpCtr = null;
+    private ?AesCtrKey $rtcpCtr = null;
+    private ?HmacSha1Key $rtpHmac = null;
+    private ?HmacSha1Key $rtcpHmac = null;
 
     /**
      * The packet indexes used so far for each SSRC, within the replay window.
@@ -118,6 +128,7 @@ final class Session
             $masterKey = $policy->getMasterKey();
             $masterSalt = $policy->getMasterSalt();
             $keyLength = \strlen($masterKey);
+            $masterKey = new AesCtrKey($masterKey);
             $saltLength = \strlen($masterSalt);
 
             $rtpKey = self::derive($masterKey, $masterSalt, self::LABEL_RTP_ENCRYPTION, $keyLength);
@@ -130,6 +141,7 @@ final class Session
             $rtcpAuthKey = $aead
                 ? ''
                 : self::derive($masterKey, $masterSalt, self::LABEL_RTCP_AUTH, self::AUTH_KEY_LENGTH);
+            $keys = self::setUpKeys($aead, $rtpKey, $rtcpKey, $rtpAuthKey, $rtcpAuthKey);
             $keyId = hash('sha256', $profile->value."\0".$material, true);
             if (\strlen($keyId) !== 32) {
                 throw new SrtpValidateException('Could not identify the installed SRTP master key.');
@@ -172,6 +184,7 @@ final class Session
         $this->rtcpKey = $rtcpKey;
         $this->rtcpSalt = $rtcpSalt;
         $this->rtcpAuthKey = $rtcpAuthKey;
+        [$this->rtpGcm, $this->rtcpGcm, $this->rtpCtr, $this->rtcpCtr, $this->rtpHmac, $this->rtcpHmac] = $keys;
         $this->ssrcType = $policy->getSsrcType();
         $this->ssrcValue = $policy->getSsrcValue();
         $this->masterKeyId = $keyId;
@@ -179,6 +192,51 @@ final class Session
             $this->keyGeneration++;
         }
         $this->ready = true;
+    }
+
+    /**
+     * Set up the key objects of session keys, once for all the packets.
+     *
+     * @return array{?AesGcmKey, ?AesGcmKey, ?AesCtrKey, ?AesCtrKey, ?HmacSha1Key, ?HmacSha1Key}
+     */
+    private static function setUpKeys(
+        bool $aead,
+        #[\SensitiveParameter] string $rtpKey,
+        #[\SensitiveParameter] string $rtcpKey,
+        #[\SensitiveParameter] string $rtpAuthKey,
+        #[\SensitiveParameter] string $rtcpAuthKey,
+    ): array {
+        if ($aead) {
+            return [new AesGcmKey($rtpKey), new AesGcmKey($rtcpKey), null, null, null, null];
+        }
+        return [
+            null,
+            null,
+            new AesCtrKey($rtpKey),
+            new AesCtrKey($rtcpKey),
+            new HmacSha1Key($rtpAuthKey),
+            new HmacSha1Key($rtcpAuthKey),
+        ];
+    }
+
+    /** @return list<string> */
+    public function __sleep(): array
+    {
+        $properties = [];
+        foreach (get_object_vars($this) as $name => $_) {
+            if (!isset(self::KEY_OBJECTS[$name])) {
+                $properties[] = $name;
+            }
+        }
+        return $properties;
+    }
+
+    public function __wakeup(): void
+    {
+        if ($this->ready) {
+            [$this->rtpGcm, $this->rtcpGcm, $this->rtpCtr, $this->rtcpCtr, $this->rtpHmac, $this->rtcpHmac]
+                = self::setUpKeys($this->aead, $this->rtpKey, $this->rtcpKey, $this->rtpAuthKey, $this->rtcpAuthKey);
+        }
     }
 
     /**
@@ -199,43 +257,39 @@ final class Session
     }
 
     /** RFC 3711 AES-CM PRF with key_derivation_rate equal to zero. */
-    private static function derive(string $masterKey, string $masterSalt, int $label, int $length): string
+    private static function derive(AesCtrKey $masterKey, string $masterSalt, int $label, int $length): string
     {
         $x = str_pad($masterSalt, 16, "\0");
         $x[7] = \chr(\ord($x[7]) ^ $label);
-        return self::keystream($masterKey, $x, $length);
+        return self::aesCm($masterKey, $x, str_repeat("\0", $length));
     }
 
-    /** Produce AES counter-mode keystream. */
-    private static function keystream(string $key, string $iv, int $length): string
+    /** Encrypt (or decrypt) a payload with AES-CM. */
+    private static function aesCm(?AesCtrKey $key, string $iv, string $data): string
     {
-        if ($length > self::MAX_AES_CM_BYTES) {
+        if (\strlen($data) > self::MAX_AES_CM_BYTES) {
             throw new SrtpException('AES-CM cannot safely process more than 2^16 blocks per packet.');
         }
-        if ($length === 0) {
-            return '';
+        if ($key === null) {
+            throw new SrtpException('The SRTP session has no AES-CM key!');
         }
-        $result = Aes::ctr($key, $iv, str_repeat("\0", $length));
-        if (\strlen($result) < $length) {
+        $result = $key->apply($iv, $data);
+        if (\strlen($result) !== \strlen($data)) {
             throw new SrtpException('AES-CTR returned a truncated keystream.');
         }
-        return substr($result, 0, $length);
+        return $result;
     }
 
     /** RFC 3711 section 4.1.1 AES-CM IV. */
     private static function iv(string $salt, int $ssrc, int $index): string
     {
-        $mix = str_repeat("\0", 4).pack('N', $ssrc)
-            .pack('N', ($index >> 16) & 0xFFFFFFFF).pack('n', $index & 0xFFFF)."\0\0";
-        return str_pad($salt, 16, "\0") ^ $mix;
+        return str_pad($salt, 16, "\0") ^ pack('NNNnn', 0, $ssrc, ($index >> 16) & 0xFFFFFFFF, $index & 0xFFFF, 0);
     }
 
     /** RFC 7714 SRTP/SRTCP nonce. A 31-bit SRTCP index has two leading zero octets. */
     private static function aeadNonce(string $salt, int $ssrc, int $index): string
     {
-        $mix = "\0\0".pack('N', $ssrc)
-            .pack('N', ($index >> 16) & 0xFFFFFFFF).pack('n', $index & 0xFFFF);
-        return $salt ^ $mix;
+        return $salt ^ pack('nNNn', 0, $ssrc, ($index >> 16) & 0xFFFFFFFF, $index & 0xFFFF);
     }
 
     /** @throws SrtpException If the packet has an invalid or truncated RTP header. */
@@ -318,34 +372,27 @@ final class Session
         try {
             $headerLength = self::rtpHeaderLength($packet);
             self::validateRtpPadding($packet, $headerLength);
-            $fields = self::rtpFields($packet);
-            $ssrc = $fields['ssrc'];
+            [$seq, $ssrc] = self::rtpFields($packet);
             $this->assertSsrcAllowed($ssrc);
 
-            [$roc, $index] = $this->reserveOutgoingRtp($ssrc, $fields['seq'], $packet);
+            [$roc, $index] = $this->reserveOutgoingRtp($ssrc, $seq, $packet);
 
             $header = substr($packet, 0, $headerLength);
             $payload = substr($packet, $headerLength);
             if ($this->aead) {
                 $result = $header.$this->encryptGcm(
-                    $this->rtpKey,
+                    $this->rtpGcm,
                     self::aeadNonce($this->rtpSalt, $ssrc, $index),
                     $header,
                     $payload,
                     'SRTP'
                 );
             } else {
-                $encrypted = $payload === ''
-                    ? ''
-                    : $payload ^ self::keystream(
-                        $this->rtpKey,
-                        self::iv($this->rtpSalt, $ssrc, $index),
-                        \strlen($payload)
-                    );
+                $encrypted = self::aesCm($this->rtpCtr, self::iv($this->rtpSalt, $ssrc, $index), $payload);
                 $authenticated = $header.$encrypted;
                 $tag = substr(self::hmacSha1(
                     $authenticated.pack('N', $roc),
-                    $this->rtpAuthKey
+                    $this->rtpHmac
                 ), 0, $this->rtpTagLength);
                 $result = $authenticated.$tag;
             }
@@ -363,18 +410,18 @@ final class Session
         $this->assertReady();
         try {
             $headerLength = self::rtpHeaderLength($packet, $this->rtpTagLength);
-            $fields = self::rtpFields($packet);
-            $this->assertSsrcAllowed($fields['ssrc']);
-            [$roc, $index] = $this->estimateIncomingRtp($fields['ssrc'], $fields['seq']);
-            $this->checkReplay($this->rtpReceiveState[$fields['ssrc']] ?? null, $index, 'SRTP');
+            [$seq, $ssrc] = self::rtpFields($packet);
+            $this->assertSsrcAllowed($ssrc);
+            [$roc, $index] = $this->estimateIncomingRtp($ssrc, $seq);
+            $this->checkReplay($this->rtpReceiveState[$ssrc] ?? null, $index, 'SRTP');
 
             $header = substr($packet, 0, $headerLength);
             if ($this->aead) {
                 $body = substr($packet, $headerLength, -$this->rtpTagLength);
                 $tag = substr($packet, -$this->rtpTagLength);
                 $payload = $this->decryptGcm(
-                    $this->rtpKey,
-                    self::aeadNonce($this->rtpSalt, $fields['ssrc'], $index),
+                    $this->rtpGcm,
+                    self::aeadNonce($this->rtpSalt, $ssrc, $index),
                     $header,
                     $body,
                     $tag,
@@ -385,24 +432,18 @@ final class Session
                 $tag = substr($packet, -$this->rtpTagLength);
                 $expected = substr(self::hmacSha1(
                     $authenticated.pack('N', $roc),
-                    $this->rtpAuthKey
+                    $this->rtpHmac
                 ), 0, $this->rtpTagLength);
                 if (!hash_equals($expected, $tag)) {
                     throw new SrtpException('SRTP authentication failed!');
                 }
                 $encrypted = substr($authenticated, $headerLength);
-                $payload = $encrypted === ''
-                    ? ''
-                    : $encrypted ^ self::keystream(
-                        $this->rtpKey,
-                        self::iv($this->rtpSalt, $fields['ssrc'], $index),
-                        \strlen($encrypted)
-                    );
+                $payload = self::aesCm($this->rtpCtr, self::iv($this->rtpSalt, $ssrc, $index), $encrypted);
             }
 
             $plain = $header.$payload;
             self::validateRtpPadding($plain, $headerLength);
-            $this->acceptReplay($this->rtpReceiveState, $fields['ssrc'], $index);
+            $this->acceptReplay($this->rtpReceiveState, $ssrc, $index);
             return $plain;
         } catch (SrtpException $e) {
             throw $e;
@@ -445,7 +486,7 @@ final class Session
 
             if ($this->aead) {
                 return $header.$this->encryptGcm(
-                    $this->rtcpKey,
+                    $this->rtcpGcm,
                     self::aeadNonce($this->rtcpSalt, $ssrc, $index),
                     $header.$indexWord,
                     $payload,
@@ -453,15 +494,9 @@ final class Session
                 ).$indexWord;
             }
 
-            $encrypted = $payload === ''
-                ? ''
-                : $payload ^ self::keystream(
-                    $this->rtcpKey,
-                    self::iv($this->rtcpSalt, $ssrc, $index),
-                    \strlen($payload)
-                );
+            $encrypted = self::aesCm($this->rtcpCtr, self::iv($this->rtcpSalt, $ssrc, $index), $payload);
             $authenticated = $header.$encrypted.$indexWord;
-            $tag = substr(self::hmacSha1($authenticated, $this->rtcpAuthKey), 0, $this->rtcpTagLength);
+            $tag = substr(self::hmacSha1($authenticated, $this->rtcpHmac), 0, $this->rtcpTagLength);
             return $authenticated.$tag;
         } catch (SrtpException $e) {
             throw $e;
@@ -493,7 +528,7 @@ final class Session
                 $tag = substr($packet, -$this->rtcpTagLength);
                 $authenticated = substr($packet, 0, -$this->rtcpTagLength);
                 $expected = substr(
-                    self::hmacSha1($authenticated, $this->rtcpAuthKey),
+                    self::hmacSha1($authenticated, $this->rtcpHmac),
                     0,
                     $this->rtcpTagLength
                 );
@@ -514,16 +549,12 @@ final class Session
 
             if (!$this->aead) {
                 $this->checkReplay($this->rtcpReceiveState[$ssrc] ?? null, $index, 'SRTCP');
-                $payload = !$encrypted || $body === ''
-                    ? $body
-                    : $body ^ self::keystream(
-                        $this->rtcpKey,
-                        self::iv($this->rtcpSalt, $ssrc, $index),
-                        \strlen($body)
-                    );
+                $payload = $encrypted
+                    ? self::aesCm($this->rtcpCtr, self::iv($this->rtcpSalt, $ssrc, $index), $body)
+                    : $body;
             } elseif ($encrypted) {
                 $payload = $this->decryptGcm(
-                    $this->rtcpKey,
+                    $this->rtcpGcm,
                     self::aeadNonce($this->rtcpSalt, $ssrc, $index),
                     $header.$indexWord,
                     $body,
@@ -535,7 +566,7 @@ final class Session
             } else {
                 // With E=0 the RTCP packet and ESRTCP word are AAD; the cipher is only a tag.
                 $empty = $this->decryptGcm(
-                    $this->rtcpKey,
+                    $this->rtcpGcm,
                     self::aeadNonce($this->rtcpSalt, $ssrc, $index),
                     $header.$body.$indexWord,
                     '',
@@ -560,14 +591,17 @@ final class Session
         }
     }
 
-    /** @return array{seq: int, ssrc: int} */
+    /**
+     * The sequence number and SSRC of a packet whose header length was checked.
+     *
+     * @return array{int, int}
+     */
     private static function rtpFields(string $packet): array
     {
-        $fields = unpack('nseq/Ntimestamp/Nssrc', substr($packet, 2, 10));
-        if ($fields === false) {
-            throw new SrtpException('Could not parse the RTP header!');
-        }
-        return ['seq' => (int) $fields['seq'], 'ssrc' => (int) $fields['ssrc']];
+        return [
+            (\ord($packet[2]) << 8) | \ord($packet[3]),
+            (\ord($packet[8]) << 24) | (\ord($packet[9]) << 16) | (\ord($packet[10]) << 8) | \ord($packet[11]),
+        ];
     }
 
     private static function rtcpSsrc(string $packet): int
@@ -583,7 +617,7 @@ final class Session
      * Estimate an index relative to the greatest accepted index, following RFC 3711 Appendix A
      * with the initial-ROC guard used by interoperable implementations.
      *
-     * @return array{roc: int, index: int, difference: int}
+     * @return array{int, int, int} The ROC, the index, and how far it is ahead of the greatest one.
      */
     private static function estimateIndex(int $highestIndex, int $seq): array
     {
@@ -605,7 +639,7 @@ final class Session
             }
         }
 
-        return ['roc' => $roc, 'index' => $highestIndex + $difference, 'difference' => $difference];
+        return [$roc, $highestIndex + $difference, $difference];
     }
 
     /** @return array{int, int} ROC and packet index. */
@@ -615,22 +649,21 @@ final class Session
             throw new SrtpException('The SRTP packet limit for this key has been reached; re-keying is required.');
         }
         $this->rtpKeyInvocations++;
+        // Only compared if repeats are allowed: otherwise, any reuse is refused.
+        $used = $this->allowRepeatTx ? pack('N', $this->keyGeneration).Digest::sha256($packet) : '';
         if (!isset($this->rtpSendState[$ssrc])) {
-            $index = $seq;
-            $this->rtpSendState[$ssrc] = ['highestIndex' => $index, 'sent' => [], 'pruned' => $index];
-            $estimate = ['roc' => 0, 'index' => $index, 'difference' => 0];
-        } else {
-            $estimate = self::estimateIndex($this->rtpSendState[$ssrc]['highestIndex'], $seq);
+            // Reserve before invoking a primitive.
+            $this->rtpSendState[$ssrc] = ['highestIndex' => $seq, 'sent' => [$seq => $used], 'pruned' => $seq];
+            return [0, $seq];
         }
 
         /** @psalm-suppress UnsupportedPropertyReferenceUsage Psalm cannot model a reference into an array property; the alias is local and correct. */
         $state = &$this->rtpSendState[$ssrc];
-        $index = $estimate['index'];
-        $used = pack('N', $this->keyGeneration).Digest::sha256($packet);
+        [$roc, $index, $difference] = self::estimateIndex($state['highestIndex'], $seq);
         if (isset($state['sent'][$index])) {
             if ($this->allowRepeatTx && hash_equals($state['sent'][$index], $used)) {
                 // The same packet with the same key and index: protecting it again gives the same result.
-                return [$estimate['roc'], $index];
+                return [$roc, $index];
             }
             throw new SrtpException('Refusing to reuse an SRTP packet index!');
         }
@@ -638,15 +671,15 @@ final class Session
             throw new SrtpException('Outgoing SRTP packet index is too old to use safely!');
         }
 
-        if ($estimate['difference'] > 0) {
-            $state['highestIndex'] = $index;
-        }
         // Reserve before invoking a primitive.
         $state['sent'][$index] = $used;
-        // Not saved by older versions.
-        $state['pruned'] ??= null;
-        $this->pruneWindow($state['sent'], $state['highestIndex'], $state['pruned']);
-        return [$estimate['roc'], $index];
+        if ($difference > 0) {
+            $state['highestIndex'] = $index;
+            // The window moved. (Not saved by older versions.)
+            $state['pruned'] ??= null;
+            $this->pruneWindow($state['sent'], $index, $state['pruned']);
+        }
+        return [$roc, $index];
     }
 
     /** @return array{int, int} ROC and packet index. */
@@ -655,8 +688,8 @@ final class Session
         if (!isset($this->rtpReceiveState[$ssrc])) {
             return [0, $seq];
         }
-        $estimate = self::estimateIndex($this->rtpReceiveState[$ssrc]['highestIndex'], $seq);
-        return [$estimate['roc'], $estimate['index']];
+        [$roc, $index] = self::estimateIndex($this->rtpReceiveState[$ssrc]['highestIndex'], $seq);
+        return [$roc, $index];
     }
 
     /** @param array{highestIndex: int, received: array<int, true>, pruned?: ?int}|null $state */
@@ -681,13 +714,13 @@ final class Session
             return;
         }
         $state = &$states[$ssrc];
+        $state['received'][$index] = true;
         if ($index > $state['highestIndex']) {
             $state['highestIndex'] = $index;
+            // The window moved. (Not saved by older versions.)
+            $state['pruned'] ??= null;
+            $this->pruneWindow($state['received'], $index, $state['pruned']);
         }
-        $state['received'][$index] = true;
-        // Not saved by older versions.
-        $state['pruned'] ??= null;
-        $this->pruneWindow($state['received'], $state['highestIndex'], $state['pruned']);
     }
 
     /**
@@ -707,9 +740,12 @@ final class Session
         if ($pruned >= $oldest) {
             return;
         }
-        if ($oldest - $pruned > \count($entries)) {
+        if ($oldest - $pruned === 1) {
+            // The window moved by one packet, as it does most of the time.
+            unset($entries[$pruned]);
+        } elseif ($oldest - $pruned > \count($entries)) {
             // The window moved further than there are entries.
-            foreach (array_keys($entries) as $index) {
+            foreach ($entries as $index => $_) {
                 if ($index < $oldest) {
                     unset($entries[$index]);
                 }
@@ -723,7 +759,7 @@ final class Session
     }
 
     private function decryptGcm(
-        string $key,
+        ?AesGcmKey $key,
         string $nonce,
         string $aad,
         string $ciphertext,
@@ -737,7 +773,10 @@ final class Session
             throw new SrtpException("$protocol authentication tag has an invalid length!");
         }
         try {
-            $plain = Aes::gcmDecrypt($key, $nonce, $aad, $ciphertext, $tag);
+            if ($key === null) {
+                throw new SrtpException("$protocol has no AES-GCM key!");
+            }
+            $plain = $key->decrypt($nonce, $aad, $ciphertext, $tag);
         } catch (Throwable $e) {
             if ($e instanceof SrtpException) {
                 throw $e;
@@ -752,7 +791,7 @@ final class Session
 
     /** Return ciphertext followed by its full RFC 7714 authentication tag. */
     private function encryptGcm(
-        string $key,
+        ?AesGcmKey $key,
         string $nonce,
         string $aad,
         string $plaintext,
@@ -762,7 +801,10 @@ final class Session
             throw new SrtpException("$protocol plaintext exceeds the AES-GCM per-invocation limit!");
         }
         try {
-            $result = Aes::gcmEncrypt($key, $nonce, $aad, $plaintext);
+            if ($key === null) {
+                throw new SrtpException("$protocol has no AES-GCM key!");
+            }
+            $result = $key->encrypt($nonce, $aad, $plaintext);
         } catch (Throwable $e) {
             throw new SrtpException("$protocol encryption failed!", 0, $e);
         }
@@ -773,9 +815,12 @@ final class Session
     }
 
     /** Return a full binary HMAC-SHA1 result or fail closed. */
-    private static function hmacSha1(string $message, string $key): string
+    private static function hmacSha1(string $message, ?HmacSha1Key $key): string
     {
-        $result = Digest::hmacSha1($message, $key);
+        if ($key === null) {
+            throw new SrtpException('The SRTP session has no authentication key!');
+        }
+        $result = $key->mac($message);
         if (\strlen($result) !== self::AUTH_KEY_LENGTH) {
             throw new SrtpException('HMAC-SHA1 returned an invalid result!');
         }

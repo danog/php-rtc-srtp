@@ -12,6 +12,8 @@ use Webrtc\Srtp\Enum\SrtpProfile;
 use Webrtc\Srtp\Enum\SsrcType;
 use Webrtc\Srtp\Exception\SrtpException;
 use Webrtc\Srtp\Exception\SrtpValidateException;
+use Webrtc\Srtp\AesCtrKey;
+use Webrtc\Srtp\AesGcmKey;
 use Webrtc\Srtp\Policy;
 use Webrtc\Srtp\Session;
 
@@ -25,6 +27,10 @@ use Webrtc\Srtp\Session;
 #[CoversClass(Session::class)]
 #[UsesClass(Policy::class)]
 #[UsesClass(\Webrtc\Srtp\Aes::class)]
+#[UsesClass(AesGcmKey::class)]
+#[UsesClass(AesCtrKey::class)]
+#[UsesClass(\Webrtc\Srtp\HmacSha1Key::class)]
+#[UsesClass(\Webrtc\Srtp\Digest::class)]
 #[UsesClass(\Webrtc\Srtp\Exception\SrtpValidateException::class)]
 class SessionTest extends TestCase
 {
@@ -223,7 +229,7 @@ class SessionTest extends TestCase
     public function testRfc3711KeyDerivationVector(): void
     {
         $derive = new ReflectionMethod(Session::class, 'derive');
-        $masterKey = hex2bin('e1f97a0d3e018be0d64fa32c06de4139');
+        $masterKey = new AesCtrKey(hex2bin('e1f97a0d3e018be0d64fa32c06de4139'));
         $masterSalt = hex2bin('0ec675ad498afeebb6960b3aabe6');
 
         $this->assertSame(
@@ -594,6 +600,10 @@ class SessionTest extends TestCase
         (new ReflectionProperty(Session::class, 'rtcpKey'))->setValue(
             $session,
             hex2bin('000102030405060708090a0b0c0d0e0f')
+        );
+        (new ReflectionProperty(Session::class, 'rtcpGcm'))->setValue(
+            $session,
+            new AesGcmKey(hex2bin('000102030405060708090a0b0c0d0e0f'))
         );
         (new ReflectionProperty(Session::class, 'rtcpSalt'))->setValue(
             $session,
